@@ -19,7 +19,7 @@ GENERATED="$WINE_ROOT/generated"
 
 REV6_COMMIT="f39dbcd7d7e745d271a5fb4f57e851723a892750"
 JUICE_COMMIT="c0de19d93064eac25f87524849e12bb2d49e9a4f"
-BOOTSTRAP_REVISION="7.1"
+BOOTSTRAP_REVISION="7.2"
 MIN_IOS="${WINARC_WINE_MIN_IOS:-14.0}"
 
 die()
@@ -125,6 +125,75 @@ cat > "$GENERATED/winarc_ntdll_ios_config.h" <<'C_EOF'
 #undef HAVE_NETINET_TCP_VAR_H
 #undef HAVE_LIBPROCSTAT
 #undef HAVE_PROCSTAT_OPEN_SYSCTL
+
+/*
+ * config.h was generated against the macOS SDK. Reconcile header probes
+ * against the real iPhoneOS SDK so macOS-only/private headers cannot leak
+ * into ntdll translation units.
+ */
+#if defined(__has_include)
+
+# if defined(HAVE_SYS_VNODE_H) && !__has_include(<sys/vnode.h>)
+#  undef HAVE_SYS_VNODE_H
+# endif
+
+# if defined(HAVE_SYS_ATTR_H) && !__has_include(<sys/attr.h>)
+#  undef HAVE_SYS_ATTR_H
+# endif
+
+# if defined(HAVE_SYS_CONF_H) && !__has_include(<sys/conf.h>)
+#  undef HAVE_SYS_CONF_H
+# endif
+
+# if defined(HAVE_SYS_MOUNT_H) && !__has_include(<sys/mount.h>)
+#  undef HAVE_SYS_MOUNT_H
+# endif
+
+# if defined(HAVE_SYS_STATVFS_H) && !__has_include(<sys/statvfs.h>)
+#  undef HAVE_SYS_STATVFS_H
+# endif
+
+# if defined(HAVE_SYS_XATTR_H) && !__has_include(<sys/xattr.h>)
+#  undef HAVE_SYS_XATTR_H
+# endif
+
+# if defined(HAVE_SYS_SYSCTL_H) && !__has_include(<sys/sysctl.h>)
+#  undef HAVE_SYS_SYSCTL_H
+# endif
+
+# if defined(HAVE_SYS_SOCKETVAR_H) && !__has_include(<sys/socketvar.h>)
+#  undef HAVE_SYS_SOCKETVAR_H
+# endif
+
+# if defined(HAVE_SYS_SOCKIO_H) && !__has_include(<sys/sockio.h>)
+#  undef HAVE_SYS_SOCKIO_H
+# endif
+
+# if defined(HAVE_NET_IF_DL_H) && !__has_include(<net/if_dl.h>)
+#  undef HAVE_NET_IF_DL_H
+# endif
+
+# if defined(HAVE_NET_IF_TYPES_H) && !__has_include(<net/if_types.h>)
+#  undef HAVE_NET_IF_TYPES_H
+# endif
+
+# if defined(HAVE_NETINET_IN_PCB_H) && !__has_include(<netinet/in_pcb.h>)
+#  undef HAVE_NETINET_IN_PCB_H
+# endif
+
+# if defined(HAVE_NETINET_IP_VAR_H) && !__has_include(<netinet/ip_var.h>)
+#  undef HAVE_NETINET_IP_VAR_H
+# endif
+
+# if defined(HAVE_NETINET_UDP_VAR_H) && !__has_include(<netinet/udp_var.h>)
+#  undef HAVE_NETINET_UDP_VAR_H
+# endif
+
+# if defined(HAVE_NETINET_ICMP_VAR_H) && !__has_include(<netinet/icmp_var.h>)
+#  undef HAVE_NETINET_ICMP_VAR_H
+# endif
+
+#endif
 
 #ifndef WINE_IOS
 #define WINE_IOS 1
