@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# WinArc / Wine component bootstrap
+# WinArc Wine component bootstrap
+# v3: Juice/Wine 11.13 -> real iOS ARM64 Wine server core link gate.
 #
-# Repository policy:
-#   - WinArc is the product name.
-#   - This directory is only the modified Wine component.
-#   - Juice/Grape is used as the pinned upstream Wine/iOS base.
-#   - TrollStore/TIPA/CoreTrust/rootless execution is not WinArc mainline.
-#   - We do not remove Juice's known-good trace path until the in-process path
-#     has independently passed its build/runtime gates.
+# WinArc is the product. This file only prepares the modified Wine component.
+# Do not remove the known-good Juice tracer route until its replacement has
+# passed independently.
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 WINE_ROOT="$ROOT/wine"
@@ -17,10 +14,15 @@ UPSTREAM="$WINE_ROOT/upstream"
 JUICE_DIR="$UPSTREAM/Juice"
 GENERATED="$WINE_ROOT/generated"
 BUILD="$WINE_ROOT/build"
+LOGS="$BUILD/logs"
+TOOLS_BUILD="$BUILD/wine-tools-macos"
+IOS_BUILD="$BUILD/wine-ios-arm64"
+SERVER_CORE="$BUILD/libWineServerCore.dylib"
 
 JUICE_REPO="https://github.com/ExoCore-Kernel/Juice.git"
 JUICE_COMMIT="c0de19d93064eac25f87524849e12bb2d49e9a4f"
-BOOTSTRAP_REVISION="2"
+BOOTSTRAP_REVISION="3"
+MIN_IOS="${WINARC_WINE_MIN_IOS:-14.0}"
 
 die()
 {
@@ -45,7 +47,7 @@ echo "WINARC_COMPONENT=wine"
 echo "WINARC_WINE_BOOTSTRAP_REVISION=$BOOTSTRAP_REVISION"
 echo "JUICE_PIN=$JUICE_COMMIT"
 
-mkdir -p "$UPSTREAM" "$GENERATED" "$BUILD"
+mkdir -p "$UPSTREAM" "$GENERATED" "$BUILD" "$LOGS"
 
 if test ! -d "$JUICE_DIR/.git"; then
     rm -rf "$JUICE_DIR"
@@ -63,12 +65,13 @@ test "$actual" = "$JUICE_COMMIT" || die "pinned Juice commit mismatch: $actual"
 WINE="$JUICE_DIR/wine"
 
 # ---------------------------------------------------------------------------
-# Gate 1: prove that the specific Juice/Wine revision still exposes the exact
-# upstream interfaces required by the in-process migration.
+# Gate 1: lock the exact Wine interfaces used by the migration.
 # ---------------------------------------------------------------------------
 
 require_file "$WINE/server/process.h"
 require_file "$WINE/server/thread.h"
+require_file "$WINE/server/file.h"
+require_file "$WINE/server/request.h"
 require_file "$WINE/dlls/ntdll/unix/server.c"
 require_file "$WINE/dlls/ntdll/unix/loader.c"
 require_file "$WINE/include/wine/server_protocol.h"
@@ -83,21 +86,17 @@ require_text "$WINE/dlls/ntdll/unix/server.c" \
     'data->request_fd = wine_server_receive_fd( &version );'
 require_text "$WINE/dlls/ntdll/unix/loader.c" \
     "DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )"
+require_text "$WINE/server/file.h" \
+    "extern void main_loop(void);"
 
 echo "WINE_11_13_CREATE_PROCESS_API=PASS"
 echo "WINE_11_13_CREATE_THREAD_API=PASS"
 echo "WINE_11_13_WINESERVERSOCKET=PASS"
 echo "WINE_11_13_WINE_MAIN_EXPORT=PASS"
+echo "WINE_11_13_SERVER_MAIN_LOOP_API=PASS"
 
 # ---------------------------------------------------------------------------
-# Gate 2: generate the first WinArc-side Wine bridge.
-#
-# This is intentionally based on the path already validated in the old
-# WineIOS-Core work, but renamed and isolated from the WinArc product layer.
-#
-# Important: this is only the native Wine FD bootstrap. It does not claim that
-# full server_init_process() is running yet. The real Wine server event loop
-# and persistent process lifetime are the next gate.
+# Gate 2: WinArc-side reusable server bridge sources.
 # ---------------------------------------------------------------------------
 
 cat > "$GENERATED/WineServerNativeBootstrap.c" <<'C_EOF'
@@ -137,18 +136,6 @@ uint32_t wine_inproc_bootstrap_stage(void)
     return bootstrap_stage;
 }
 
-/*
- * Compatibility gate for Wine's real initial process/thread FD handshake.
- *
- * server_fd is one end of an AF_UNIX SOCK_STREAM socketpair and ownership is
- * transferred to Wine server create_process(). create_thread(-1, ...) then
- * asks Wine itself to create its request pipe and transfer the client end via
- * SCM_RIGHTS together with SERVER_PROTOCOL_VERSION.
- *
- * This gate intentionally tears the temporary process/thread back down after
- * the handshake. A later stage will retain them and run Wine's real server
- * event loop. Keeping this gate one-shot makes regressions unambiguous.
- */
 __attribute__((visibility("default")))
 int wine_inproc_bootstrap_client(int server_fd)
 {
@@ -162,7 +149,6 @@ int wine_inproc_bootstrap_client(int server_fd)
     int result = -1;
 
     bootstrap_stage = WINE_INPROC_STAGE_IDLE;
-
     if (server_fd < 0) return -1;
 
     flags = fcntl(server_fd, F_GETFL, 0);
@@ -184,16 +170,11 @@ int wine_inproc_bootstrap_client(int server_fd)
     supported_machines[0] = IMAGE_FILE_MACHINE_ARM64;
     clear_error();
 
-    /* create_process() consumes server_fd. */
     process = create_process(server_fd, NULL, 0, NULL, NULL, NULL, 0, NULL);
     server_fd = -1;
     if (!process) goto done;
     bootstrap_stage = WINE_INPROC_STAGE_PROCESS;
 
-    /*
-     * fd == -1 selects Wine's normal initial request-pipe bootstrap path.
-     * Successful create_thread() means send_client_fd() has completed.
-     */
     thread = create_thread(-1, process, NULL);
     if (!thread) goto done;
     bootstrap_stage = WINE_INPROC_STAGE_THREAD;
@@ -207,7 +188,6 @@ done:
         kill_thread(thread, 0);
         thread = NULL;
     }
-
     if (process) release_object(process);
     if (server_fd >= 0) close(server_fd);
 
@@ -221,61 +201,246 @@ done:
 }
 C_EOF
 
-# The server executable normally owns these four globals in server/main.c.
-# The reusable core excludes main.o, so provide only those ABI globals.
 cat > "$GENERATED/WineServerGlobals.c" <<'C_EOF'
+#include <stdint.h>
+
+#include "wine/server_protocol.h"
 #include "object.h"
 
 #define WINE_TICKS_PER_SEC 10000000
 
 int debug_level = 0;
 int foreground = 1;
-timeout_t master_socket_timeout =
-    (timeout_t)(-3LL * WINE_TICKS_PER_SEC);
+timeout_t master_socket_timeout = (timeout_t)(-3LL * WINE_TICKS_PER_SEC);
 const char *server_argv0 = "wine-inprocess";
+
+__attribute__((visibility("default")))
+uint32_t wine_inproc_server_protocol_version(void)
+{
+    return (uint32_t)SERVER_PROTOCOL_VERSION;
+}
+
+__attribute__((visibility("default")))
+uint32_t wine_inproc_server_core_abi_version(void)
+{
+    return 1u;
+}
 C_EOF
 
 # ---------------------------------------------------------------------------
-# Gate 3: compile the new bridge as plain objects when a compiler is available.
-# This is deliberately a source/API gate, not a full Wine link yet.
+# Gate 3: host Wine tools + public-iPhoneOS cross configure.
 # ---------------------------------------------------------------------------
 
-CC_BIN="${CC:-}"
-if test -z "$CC_BIN"; then
-    if command -v clang >/dev/null 2>&1; then
-        CC_BIN="$(command -v clang)"
-    elif command -v cc >/dev/null 2>&1; then
-        CC_BIN="$(command -v cc)"
+test "$(uname -s)" = "Darwin" || die "v3 iOS server-core gate requires macOS"
+
+command -v xcrun >/dev/null 2>&1 || die "xcrun not found"
+command -v make >/dev/null 2>&1 || die "make not found"
+
+if command -v brew >/dev/null 2>&1; then
+    BREW_PREFIX="$(brew --prefix)"
+    if brew --prefix bison >/dev/null 2>&1; then
+        BISON_BIN="$(brew --prefix bison)/bin"
+    else
+        BISON_BIN=""
     fi
+    if brew --prefix flex >/dev/null 2>&1; then
+        FLEX_BIN="$(brew --prefix flex)/bin"
+    else
+        FLEX_BIN=""
+    fi
+    export PATH="${BISON_BIN:+$BISON_BIN:}${FLEX_BIN:+$FLEX_BIN:}$PATH"
 fi
 
-if test -n "$CC_BIN"; then
-    COMMON=(
-        -D__WINESRC__
-        -fms-extensions
-        -I"$WINE/include"
-        -I"$WINE/server"
+if test ! -x "$TOOLS_BUILD/tools/makedep" || \
+   test ! -x "$TOOLS_BUILD/tools/winebuild/winebuild"; then
+    rm -rf "$TOOLS_BUILD"
+    mkdir -p "$TOOLS_BUILD"
+    (
+        cd "$TOOLS_BUILD"
+        "$WINE/configure" \
+            --enable-archs=none \
+            --disable-tests \
+            --without-alsa \
+            --without-capi \
+            --without-coreaudio \
+            --without-cups \
+            --without-dbus \
+            --without-ffmpeg \
+            --without-fontconfig \
+            --without-freetype \
+            --without-gettext \
+            --without-gphoto \
+            --without-gnutls \
+            --without-gssapi \
+            --without-gstreamer \
+            --without-krb5 \
+            --without-mingw \
+            --without-opencl \
+            --without-opengl \
+            --without-pcap \
+            --without-pcsclite \
+            --without-sdl \
+            --without-usb \
+            --without-vulkan \
+            --without-wayland \
+            --without-x \
+            2>&1 | tee "$LOGS/wine-tools-configure.log"
     )
 
-    "$CC_BIN" "${COMMON[@]}" \
-        -c "$GENERATED/WineServerNativeBootstrap.c" \
-        -o "$BUILD/WineServerNativeBootstrap.o"
-
-    "$CC_BIN" "${COMMON[@]}" \
-        -c "$GENERATED/WineServerGlobals.c" \
-        -o "$BUILD/WineServerGlobals.o"
-
-    echo "WINE_INPROC_BRIDGE_COMPILE=PASS"
-else
-    echo "WINE_INPROC_BRIDGE_COMPILE=SKIP_NO_COMPILER"
+    make -C "$TOOLS_BUILD" -j2 __tooldeps__ \
+        2>&1 | tee "$LOGS/wine-tools-build.log"
 fi
 
+test -x "$TOOLS_BUILD/tools/makedep" || die "host makedep was not built"
+test -x "$TOOLS_BUILD/tools/winebuild/winebuild" || die "host winebuild was not built"
+
+echo "WINE_HOST_TOOLS=PASS"
+
+SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+CLANG="$(xcrun --sdk iphoneos --find clang)"
+CLANGXX="$(xcrun --sdk iphoneos --find clang++)"
+IOS_TARGET="arm64-apple-ios$MIN_IOS"
+
+rm -rf "$IOS_BUILD"
+mkdir -p "$IOS_BUILD"
+
+export CC="$CLANG -target $IOS_TARGET -isysroot $SDK"
+export CXX="$CLANGXX -target $IOS_TARGET -isysroot $SDK"
+export OBJC="$CC"
+export OBJCXX="$CXX"
+export CPPFLAGS="-D_WINE_IOS_BUILD=1"
+export CFLAGS="-Os -fvisibility=hidden"
+export CXXFLAGS="$CFLAGS"
+export LDFLAGS="-Wl,-dead_strip"
+
+(
+    cd "$IOS_BUILD"
+    "$WINE/configure" \
+        --build="$("$WINE/tools/config.guess")" \
+        --host=aarch64-apple-ios \
+        --with-wine-tools="$TOOLS_BUILD" \
+        --without-mingw \
+        --disable-tests \
+        --without-alsa \
+        --without-capi \
+        --without-coreaudio \
+        --without-cups \
+        --without-dbus \
+        --without-ffmpeg \
+        --without-fontconfig \
+        --without-freetype \
+        --without-gettext \
+        --without-gphoto \
+        --without-gnutls \
+        --without-gssapi \
+        --without-gstreamer \
+        --without-inotify \
+        --without-krb5 \
+        --without-netapi \
+        --without-opencl \
+        --without-opengl \
+        --without-oss \
+        --without-pcap \
+        --without-pcsclite \
+        --without-pulse \
+        --without-sane \
+        --without-sdl \
+        --without-udev \
+        --without-usb \
+        --without-v4l2 \
+        --without-vulkan \
+        --without-wayland \
+        --without-x \
+        2>&1 | tee "$LOGS/wine-ios-configure.log"
+)
+
+require_file "$IOS_BUILD/Makefile"
+require_file "$IOS_BUILD/include/config.h"
+
+grep -q '^host_os = ios' "$IOS_BUILD/Makefile" || die "Wine configure did not select host_os=ios"
+grep -q '^HOST_ARCH = aarch64' "$IOS_BUILD/Makefile" || die "Wine configure did not select HOST_ARCH=aarch64"
+grep -q '^#define WINE_IOS 1' "$IOS_BUILD/include/config.h" || die "WINE_IOS was not defined"
+
+echo "WINE_IOS_CONFIGURE=PASS"
+
 # ---------------------------------------------------------------------------
-# Do not mutate the known-good Juice checkout yet.
-# The old tracer path remains available as a reference until the replacement
-# passes the real persistent server + __wine_main gate.
+# Gate 4: build Wine's real server objects, then relink without server/main.o.
 # ---------------------------------------------------------------------------
 
+make -C "$IOS_BUILD" -j2 server/wineserver \
+    2>&1 | tee "$LOGS/wine-server-build.log"
+
+OBJECT_LIST="$BUILD/wine-server-core-objects.txt"
+: > "$OBJECT_LIST"
+
+server_objects=()
+for obj in "$IOS_BUILD"/server/*.o; do
+    test -f "$obj" || continue
+    test "$(basename "$obj")" = "main.o" && continue
+    server_objects+=("$obj")
+    printf '%s\n' "$obj" >> "$OBJECT_LIST"
+done
+
+test "${#server_objects[@]}" -ge 20 || die "too few Wine server objects: ${#server_objects[@]}"
+
+COMMON_IOS=(
+    -target "$IOS_TARGET"
+    -arch arm64
+    -isysroot "$SDK"
+    "-miphoneos-version-min=$MIN_IOS"
+    -D__WINESRC__
+    -fms-extensions
+    -I"$IOS_BUILD/include"
+    -I"$WINE/include"
+    -I"$WINE/server"
+)
+
+"$CLANG" "${COMMON_IOS[@]}" \
+    -c "$GENERATED/WineServerNativeBootstrap.c" \
+    -o "$BUILD/WineServerNativeBootstrap.o"
+
+"$CLANG" "${COMMON_IOS[@]}" \
+    -c "$GENERATED/WineServerGlobals.c" \
+    -o "$BUILD/WineServerGlobals.o"
+
+rm -f "$SERVER_CORE"
+
+"$CLANG" \
+    -target "$IOS_TARGET" \
+    -arch arm64 \
+    -isysroot "$SDK" \
+    "-miphoneos-version-min=$MIN_IOS" \
+    -dynamiclib \
+    -Wl,-undefined,error \
+    -Wl,-install_name,@rpath/libWineServerCore.dylib \
+    "${server_objects[@]}" \
+    "$BUILD/WineServerNativeBootstrap.o" \
+    "$BUILD/WineServerGlobals.o" \
+    -o "$SERVER_CORE" \
+    2>&1 | tee "$LOGS/wine-server-core-link.log"
+
+test -s "$SERVER_CORE" || die "Wine server core dylib was not produced"
+
+file "$SERVER_CORE" | tee "$LOGS/wine-server-core-file.log"
+file "$SERVER_CORE" | grep -q 'Mach-O 64-bit' || die "server core is not Mach-O 64-bit"
+file "$SERVER_CORE" | grep -q 'arm64' || die "server core is not arm64"
+
+xcrun nm -gU "$SERVER_CORE" > "$LOGS/wine-server-core-symbols.log"
+
+grep -q ' _wine_inproc_server_protocol_version$' "$LOGS/wine-server-core-symbols.log" \
+    || die "protocol export missing"
+grep -q ' _wine_inproc_bootstrap_client$' "$LOGS/wine-server-core-symbols.log" \
+    || die "native bootstrap export missing"
+grep -q ' _wine_inproc_bootstrap_stage$' "$LOGS/wine-server-core-symbols.log" \
+    || die "bootstrap stage export missing"
+
+echo "WINE_INPROC_BRIDGE_COMPILE=PASS"
+echo "WINE_IOS_SERVER_OBJECTS=PASS count=${#server_objects[@]}"
+echo "WINE_IOS_SERVER_CORE_LINK=PASS"
+echo "WINE_INPROC_FD_GATE_SOURCE=READY"
+
+# Keep old route until the new core has a persistent server thread and a real
+# ntdll client connected to it.
 cat > "$WINE_ROOT/BASELINE" <<EOF
 WINARC_COMPONENT=wine
 BOOTSTRAP_REVISION=$BOOTSTRAP_REVISION
@@ -283,6 +448,7 @@ UPSTREAM=ExoCore-Kernel/Juice
 UPSTREAM_COMMIT=$JUICE_COMMIT
 PRODUCT_NAME=WinArc
 COMPONENT_NAME=Wine
+MIN_IOS=$MIN_IOS
 
 TROLLSTORE_MAINLINE=NO
 TIPA_MAINLINE=NO
@@ -290,8 +456,8 @@ VAR_JB_MAINLINE=NO
 CORETRUST_MAINLINE=NO
 
 JUICE_WINE_SOURCE_LOCKED=YES
-WINE_INPROC_CREATE_PROCESS_API=PASS
-WINE_INPROC_CREATE_THREAD_API=PASS
+WINE_IOS_CONFIGURE=PASS
+WINE_IOS_SERVER_CORE_LINK=PASS
 WINE_INPROC_WINESERVERSOCKET_API=PASS
 WINE_INPROC_WINE_MAIN_EXPORT=PASS
 
@@ -299,10 +465,9 @@ TRACE_PARENT_REMOVED=NO
 WINE_SERVER_PERSISTENT_INPROCESS=NOT_YET
 WINE_MAIN_INPROCESS=NOT_YET
 
-NEXT_STAGE=persistent-inprocess-wineserver
+NEXT_STAGE=server-thread-and-signal-isolation
 EOF
 
 echo "WINARC_WINE_BOOTSTRAP=PASS"
-echo "WINE_INPROC_FD_GATE_SOURCE=READY"
 echo "TRACE_PARENT_REMOVED=NO"
-echo "NEXT_STAGE=PERSISTENT_INPROCESS_WINESERVER"
+echo "NEXT_STAGE=SERVER_THREAD_AND_SIGNAL_ISOLATION"
