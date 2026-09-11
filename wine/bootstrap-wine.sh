@@ -24,11 +24,13 @@ BUILD="$WINE_ROOT/build"
 LOGS="$BUILD/logs"
 HOST_BUILD="$BUILD/wine-host-tools"
 IOS_OBJ="$BUILD/wineserver-ios-obj"
+CLIENT_OBJ="$BUILD/wineclient-ios-obj"
 SERVER_ARCHIVE="$BUILD/libWinArcWineServer.a"
+CLIENT_ARCHIVE="$BUILD/libWinArcWineClientBridge.a"
 
 JUICE_REPO="https://github.com/ExoCore-Kernel/Juice.git"
 JUICE_COMMIT="c0de19d93064eac25f87524849e12bb2d49e9a4f"
-BOOTSTRAP_REVISION="5"
+BOOTSTRAP_REVISION="6"
 MIN_IOS="${WINARC_WINE_MIN_IOS:-14.0}"
 JOBS="${WINARC_JOBS:-2}"
 
@@ -58,7 +60,7 @@ log()
 
 log "WINARC_COMPONENT=wine"
 log "WINARC_WINE_BOOTSTRAP_REVISION=$BOOTSTRAP_REVISION"
-log "WINARC_WINE_ROUTE=JUICE_SERVER_DIRECT_STATIC_EMBEDDED"
+log "WINARC_WINE_ROUTE=JUICE_SERVER_DIRECT_STATIC_EMBEDDED_CLIENT_BRIDGE"
 log "JUICE_PIN=$JUICE_COMMIT"
 
 mkdir -p "$UPSTREAM" "$GENERATED" "$BUILD" "$LOGS"
@@ -92,6 +94,9 @@ require_file "$WINE/server/file.h"
 require_file "$WINE/server/object.h"
 require_file "$WINE/server/unicode.h"
 require_file "$WINE/include/wine/server_protocol.h"
+require_file "$WINE/dlls/ntdll/Makefile.in"
+require_file "$WINE/dlls/ntdll/unix/server.c"
+require_file "$WINE/dlls/ntdll/unix/loader.c"
 
 require_text "$WINE/server/process.h" "Use ptrace on iOS while retaining Mach on macOS."
 require_text "$WINE/server/process.h" "__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__"
@@ -100,9 +105,15 @@ require_text "$WINE/server/file.h" "extern void main_loop(void);"
 require_text "$WINE/server/object.h" "extern void init_threading(void);"
 require_text "$WINE/server/object.h" "extern void init_registry(void);"
 require_text "$WINE/server/unicode.h" "extern struct fd *load_intl_file(void);"
+require_text "$WINE/dlls/ntdll/unix/server.c" "WINESERVERSOCKET"
+require_text "$WINE/dlls/ntdll/unix/server.c" "unsetenv( \"WINESERVERSOCKET\" )"
+require_text "$WINE/dlls/ntdll/unix/loader.c" "__wine_main"
+require_text "$WINE/dlls/ntdll/Makefile.in" "UNIXLIB   = ntdll.so"
 
 log "JUICE_IOS_SERVER_PATCHES=PASS"
 log "WINE_EMBEDDED_SERVER_APIS=PASS"
+log "WINE_CLIENT_NTDLL_SOCKET_CONTRACT=PASS"
+log "WINE_CLIENT_WINE_MAIN_CONTRACT=PASS"
 
 # ---------------------------------------------------------------------------
 # Gate 2: native host Wine tools/config header only.
@@ -542,13 +553,23 @@ int winarc_wineserver_embedded_start(const char *prefix_path, int *client_socket
     runtime_thread_valid = 1;
 
     pthread_mutex_lock(&runtime_lock);
+    /*
+     * Do not hand the process socket to ntdll until the server thread has
+     * completed initialization and is about to enter main_loop(). Requests
+     * written a few instructions before poll() starts are safely queued.
+     */
     while (runtime_stage > WINARC_WS_IDLE &&
-           runtime_stage < WINARC_WS_CLIENT_READY)
+           runtime_stage < WINARC_WS_MAIN_LOOP)
         pthread_cond_wait(&runtime_cond, &runtime_lock);
 
-    if (runtime_stage < WINARC_WS_CLIENT_READY)
+    if (runtime_stage != WINARC_WS_MAIN_LOOP)
     {
-        ret = runtime_status ? runtime_status : EIO;
+        ret = runtime_status ? runtime_status : ENOTCONN;
+        if (runtime_client_fd >= 0)
+        {
+            close(runtime_client_fd);
+            runtime_client_fd = -1;
+        }
         pthread_mutex_unlock(&runtime_lock);
         return ret;
     }
@@ -609,6 +630,342 @@ int winarc_wineserver_embedded_stage(void)
 }
 C_EOF
 
+# ---------------------------------------------------------------------------
+# Gate 7: Wine client in-process handoff.
+#
+# This is the app-facing boundary for the next stage:
+#   embedded wineserver -> client process socket -> WINESERVERSOCKET
+#   -> dlopen(ntdll.so) -> dlsym(__wine_main) -> Wine client pthread.
+#
+# ntdll.so itself is deliberately not fabricated here. Juice proves that
+# dlls/ntdll/ntdll.so is an independently buildable native target; the next
+# stage will reproduce that target on the normal iPhoneOS SDK without the
+# donor's TrollStore/CoreTrust compiler wrapper.
+# ---------------------------------------------------------------------------
+
+cat > "$GENERATED/WineClientInProcessBridge.c" <<'C_EOF'
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+typedef void (*winarc_wine_main_fn)(int argc, char **argv);
+
+enum winarc_wine_client_stage
+{
+    WINARC_WINE_CLIENT_IDLE = 0,
+    WINARC_WINE_CLIENT_STARTING = 1,
+    WINARC_WINE_CLIENT_NTDLL_LOADED = 2,
+    WINARC_WINE_CLIENT_MAIN_ENTERED = 3,
+    WINARC_WINE_CLIENT_RETURNED = 4,
+    WINARC_WINE_CLIENT_FAILED = -1
+};
+
+extern int winarc_wineserver_embedded_start(const char *prefix_path,
+                                             int *client_socket_out);
+extern int winarc_wineserver_embedded_request_stop(void);
+
+struct winarc_wine_client_context
+{
+    char *ntdll_path;
+    int server_fd;
+    int argc;
+    char **argv;
+};
+
+static pthread_mutex_t client_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t client_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t client_thread;
+static int client_thread_valid;
+static int client_stage = WINARC_WINE_CLIENT_IDLE;
+static int client_status;
+static void *client_ntdll_handle;
+
+static void client_set_stage(int stage, int status)
+{
+    pthread_mutex_lock(&client_lock);
+    client_stage = stage;
+    client_status = status;
+    pthread_cond_broadcast(&client_cond);
+    pthread_mutex_unlock(&client_lock);
+}
+
+static void free_context(struct winarc_wine_client_context *ctx)
+{
+    int i;
+
+    if (!ctx) return;
+    if (ctx->argv)
+    {
+        for (i = 0; i < ctx->argc; ++i) free(ctx->argv[i]);
+        free(ctx->argv);
+    }
+    free(ctx->ntdll_path);
+    free(ctx);
+}
+
+static struct winarc_wine_client_context *copy_context(const char *ntdll_path,
+                                                        int argc,
+                                                        char *const argv[])
+{
+    struct winarc_wine_client_context *ctx;
+    int i;
+
+    if (!ntdll_path || !*ntdll_path || argc < 1 || !argv || !argv[0])
+        return NULL;
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) return NULL;
+
+    ctx->ntdll_path = strdup(ntdll_path);
+    ctx->argc = argc;
+    ctx->server_fd = -1;
+    ctx->argv = calloc((size_t)argc + 1, sizeof(*ctx->argv));
+    if (!ctx->ntdll_path || !ctx->argv)
+    {
+        free_context(ctx);
+        return NULL;
+    }
+
+    for (i = 0; i < argc; ++i)
+    {
+        if (!argv[i])
+        {
+            free_context(ctx);
+            return NULL;
+        }
+        ctx->argv[i] = strdup(argv[i]);
+        if (!ctx->argv[i])
+        {
+            free_context(ctx);
+            return NULL;
+        }
+    }
+    return ctx;
+}
+
+static int bind_server_socket_environment(int fd)
+{
+    char text[32];
+
+    if (fd < 0 || fcntl(fd, F_GETFD) == -1) return EBADF;
+    if (snprintf(text, sizeof(text), "%d", fd) <= 0) return EINVAL;
+    if (setenv("WINESERVERSOCKET", text, 1) != 0) return errno ? errno : EIO;
+    return 0;
+}
+
+static void client_fail(struct winarc_wine_client_context *ctx, int status,
+                        int environment_bound)
+{
+    if (environment_bound) unsetenv("WINESERVERSOCKET");
+    if (ctx && ctx->server_fd >= 0)
+    {
+        close(ctx->server_fd);
+        ctx->server_fd = -1;
+    }
+    winarc_wineserver_embedded_request_stop();
+    client_set_stage(WINARC_WINE_CLIENT_FAILED, status ? status : EIO);
+    free_context(ctx);
+}
+
+static void *wine_client_thread_entry(void *opaque)
+{
+    struct winarc_wine_client_context *ctx = opaque;
+    winarc_wine_main_fn wine_main;
+    const char *error;
+    int ret;
+
+    ret = bind_server_socket_environment(ctx->server_fd);
+    if (ret)
+    {
+        client_fail(ctx, ret, 0);
+        return NULL;
+    }
+
+    /*
+     * RTLD_LOCAL keeps the native Wine client implementation out of the
+     * global UIKit symbol namespace. ntdll's own init_paths() uses dladdr()
+     * on itself, so ntdll_path must point at the final bundled ntdll.so.
+     */
+    dlerror();
+    client_ntdll_handle = dlopen(ctx->ntdll_path, RTLD_NOW | RTLD_LOCAL);
+    if (!client_ntdll_handle)
+    {
+        error = dlerror();
+        (void)error;
+        client_fail(ctx, ENOEXEC, 1);
+        return NULL;
+    }
+    client_set_stage(WINARC_WINE_CLIENT_NTDLL_LOADED, 0);
+
+    dlerror();
+    wine_main = (winarc_wine_main_fn)dlsym(client_ntdll_handle, "__wine_main");
+    error = dlerror();
+    if (!wine_main || error)
+    {
+        client_fail(ctx, ENOENT, 1);
+        return NULL;
+    }
+
+    /*
+     * Wine's server_init_process() consumes WINESERVERSOCKET itself and
+     * unsets it. Ownership of server_fd therefore transfers to ntdll here.
+     */
+    client_set_stage(WINARC_WINE_CLIENT_MAIN_ENTERED, 0);
+    wine_main(ctx->argc, ctx->argv);
+
+    /*
+     * __wine_main normally owns the Wine lifetime. If it returns, tear down
+     * the direct server relationship without sending a Unix signal to UIKit.
+     */
+    if (ctx->server_fd >= 0)
+    {
+        close(ctx->server_fd);
+        ctx->server_fd = -1;
+    }
+    winarc_wineserver_embedded_request_stop();
+    client_set_stage(WINARC_WINE_CLIENT_RETURNED, 0);
+    free_context(ctx);
+    return NULL;
+}
+
+__attribute__((visibility("default")))
+uint32_t winarc_wine_client_bridge_abi(void)
+{
+    return 1u;
+}
+
+/*
+ * Start one ARM64 Wine client in-process.
+ *
+ * The server is started first. Only after it reaches its main-loop boundary
+ * do we create the Wine client thread and expose its socket through
+ * WINESERVERSOCKET. This avoids the old child wineserver / trace-parent path.
+ */
+__attribute__((visibility("default")))
+int winarc_wine_client_start(const char *prefix_path,
+                             const char *ntdll_path,
+                             int argc,
+                             char *const argv[])
+{
+    struct winarc_wine_client_context *ctx;
+    int ret;
+
+    if (!prefix_path || !*prefix_path) return EINVAL;
+
+    ctx = copy_context(ntdll_path, argc, argv);
+    if (!ctx) return EINVAL;
+
+    pthread_mutex_lock(&client_lock);
+    if (client_stage != WINARC_WINE_CLIENT_IDLE &&
+        client_stage != WINARC_WINE_CLIENT_RETURNED &&
+        client_stage != WINARC_WINE_CLIENT_FAILED)
+    {
+        pthread_mutex_unlock(&client_lock);
+        free_context(ctx);
+        return EALREADY;
+    }
+    client_stage = WINARC_WINE_CLIENT_STARTING;
+    client_status = 0;
+    pthread_mutex_unlock(&client_lock);
+
+    ret = winarc_wineserver_embedded_start(prefix_path, &ctx->server_fd);
+    if (ret)
+    {
+        client_set_stage(WINARC_WINE_CLIENT_FAILED, ret);
+        free_context(ctx);
+        return ret;
+    }
+
+    ret = pthread_create(&client_thread, NULL, wine_client_thread_entry, ctx);
+    if (ret)
+    {
+        close(ctx->server_fd);
+        ctx->server_fd = -1;
+        winarc_wineserver_embedded_request_stop();
+        client_set_stage(WINARC_WINE_CLIENT_FAILED, ret);
+        free_context(ctx);
+        return ret;
+    }
+    client_thread_valid = 1;
+
+    /*
+     * A successful return means ntdll.so was loaded and __wine_main resolved,
+     * not merely that pthread_create() succeeded.
+     */
+    pthread_mutex_lock(&client_lock);
+    while (client_stage > WINARC_WINE_CLIENT_IDLE &&
+           client_stage < WINARC_WINE_CLIENT_MAIN_ENTERED)
+        pthread_cond_wait(&client_cond, &client_lock);
+
+    if (client_stage == WINARC_WINE_CLIENT_FAILED)
+    {
+        ret = client_status ? client_status : EIO;
+        pthread_mutex_unlock(&client_lock);
+        return ret;
+    }
+    pthread_mutex_unlock(&client_lock);
+    return 0;
+}
+
+__attribute__((visibility("default")))
+int winarc_wine_client_stage(void)
+{
+    int stage;
+    pthread_mutex_lock(&client_lock);
+    stage = client_stage;
+    pthread_mutex_unlock(&client_lock);
+    return stage;
+}
+
+__attribute__((visibility("default")))
+int winarc_wine_client_status(void)
+{
+    int status;
+    pthread_mutex_lock(&client_lock);
+    status = client_status;
+    pthread_mutex_unlock(&client_lock);
+    return status;
+}
+
+__attribute__((visibility("default")))
+int winarc_wine_client_join(void)
+{
+    pthread_t thread;
+
+    pthread_mutex_lock(&client_lock);
+    if (!client_thread_valid)
+    {
+        pthread_mutex_unlock(&client_lock);
+        return 0;
+    }
+    thread = client_thread;
+    client_thread_valid = 0;
+    pthread_mutex_unlock(&client_lock);
+
+    return pthread_join(thread, NULL);
+}
+C_EOF
+
+require_text "$GENERATED/WineClientInProcessBridge.c" \
+    'setenv("WINESERVERSOCKET"'
+require_text "$GENERATED/WineClientInProcessBridge.c" \
+    'dlsym(client_ntdll_handle, "__wine_main")'
+
+if grep -Eq '^[[:space:]]*(exec[a-z]*|posix_spawn)[[:space:]]*\(' \
+    "$GENERATED/WineClientInProcessBridge.c"; then
+    die "Wine client bridge must not spawn or exec a child process"
+fi
+
+log "WINE_CLIENT_WINESERVERSOCKET_SOURCE=PASS"
+log "WINE_CLIENT_WINE_MAIN_DLSYM_SOURCE=PASS"
+log "WINE_CLIENT_NO_CHILD_PROCESS_SOURCE=PASS"
+
 # Source-level isolation gates. Do not let comments accidentally satisfy these.
 if grep -Eq '^[[:space:]]*init_signals[[:space:]]*\(' \
     "$GENERATED/WineServerEmbeddedRuntime.c"; then
@@ -628,8 +985,8 @@ AR="$(xcrun --sdk iphoneos --find ar)"
 NM="$(xcrun --sdk iphoneos --find nm)"
 IOS_TARGET="arm64-apple-ios$MIN_IOS"
 
-rm -rf "$IOS_OBJ"
-mkdir -p "$IOS_OBJ"
+rm -rf "$IOS_OBJ" "$CLIENT_OBJ"
+mkdir -p "$IOS_OBJ" "$CLIENT_OBJ"
 
 COMMON_CFLAGS=(
     -target "$IOS_TARGET"
@@ -727,6 +1084,47 @@ log "WINE_IOS_SERVER_OBJECT_COMPILE=PASS"
 log "WINE_SERVER_EXIT_ISOLATION_OBJECT=PASS"
 log "WINE_SERVER_EMBEDDED_RUNTIME_OBJECT=PASS"
 
+"$CLANG" \
+    -target "$IOS_TARGET" \
+    -arch arm64 \
+    -isysroot "$SDK" \
+    "-miphoneos-version-min=$MIN_IOS" \
+    -O2 \
+    -fvisibility=hidden \
+    -c "$GENERATED/WineClientInProcessBridge.c" \
+    -o "$CLIENT_OBJ/WineClientInProcessBridge.o" \
+    2>"$LOGS/compile-client-inprocess-bridge.log" || {
+        cat "$LOGS/compile-client-inprocess-bridge.log" >&2
+        die "Wine client in-process bridge compile failed"
+    }
+
+rm -f "$CLIENT_ARCHIVE"
+"$AR" rcs "$CLIENT_ARCHIVE" "$CLIENT_OBJ/WineClientInProcessBridge.o"
+test -s "$CLIENT_ARCHIVE" || die "Wine client bridge archive was not produced"
+
+"$NM" -g "$CLIENT_ARCHIVE" > "$LOGS/wineclient-bridge-nm.txt"
+
+for symbol in \
+    winarc_wine_client_bridge_abi \
+    winarc_wine_client_start \
+    winarc_wine_client_stage \
+    winarc_wine_client_status \
+    winarc_wine_client_join; do
+    grep -Fq "$symbol" "$LOGS/wineclient-bridge-nm.txt" || \
+        die "required Wine client bridge symbol missing: $symbol"
+done
+
+"$NM" -u "$CLIENT_OBJ/WineClientInProcessBridge.o" \
+    > "$LOGS/wineclient-bridge-undefined.txt" || true
+
+grep -Fq "winarc_wineserver_embedded_start" \
+    "$LOGS/wineclient-bridge-undefined.txt" || \
+    die "Wine client bridge is not linked to embedded wineserver start"
+
+log "WINE_CLIENT_INPROCESS_BRIDGE_OBJECT=PASS"
+log "WINE_CLIENT_INPROCESS_BRIDGE_ARCHIVE=PASS"
+log "WINE_CLIENT_SERVER_BOUNDARY_LINK=PASS"
+
 rm -f "$SERVER_ARCHIVE"
 "$AR" rcs "$SERVER_ARCHIVE" "$IOS_OBJ"/*.o
 test -s "$SERVER_ARCHIVE" || die "static wineserver archive was not produced"
@@ -775,6 +1173,13 @@ fi
 log "WINE_SERVER_NO_PROCESS_SIGNAL_DEPENDENCY=PASS"
 log "WINE_SERVER_NO_MASTER_SOCKET_DEPENDENCY=PASS"
 
+# ntdll.so is the next build artifact. The source/runtime handoff is now fixed.
+log "WINE_CLIENT_WINESERVERSOCKET_BINDING=PASS"
+log "WINE_CLIENT_WINE_MAIN_DLSYM=PASS"
+log "WINE_CLIENT_DEDICATED_THREAD=PASS"
+log "WINE_CLIENT_INPROCESS_BRIDGE_COMPILE=PASS"
+log "WINE_CLIENT_NTDLL_BINARY=NOT_YET"
+
 # Keep the previous route guard.
 obsolete_host="$(printf '%s%s' '--host=aarch64-apple-' 'ios')"
 if grep -Fq -- "$obsolete_host" "$0"; then
@@ -796,18 +1201,25 @@ SERVER_MASTER_SOCKET=NOT_USED_BY_EMBEDDED_ENTRY
 SERVER_DIRECT_CLIENT_SOCKETPAIR=COMPILE_READY
 SERVER_EXIT_TO_PTHREAD_EXIT=COMPILE_READY
 SERVER_SAFE_SELF_KILL=COMPILE_READY
+SERVER_READY_BEFORE_CLIENT_HANDOFF=COMPILE_READY
+
+WINE_CLIENT_BRIDGE_ARCHIVE=libWinArcWineClientBridge.a
+WINE_CLIENT_INPROCESS_BRIDGE_COMPILE=PASS
+WINE_CLIENT_THREAD_MODEL=DEDICATED_PTHREAD
+NTDLL_WINESERVERSOCKET_LINK=SOURCE_AND_BRIDGE_READY
+WINE_MAIN_ENTRY=DLSYM_BRIDGE_READY
+NTDLL_NATIVE_BINARY=NOT_YET
 
 TRACE_PARENT_REMOVED=NO
-WINE_CLIENT_INPROCESS=NOT_YET
-NTDLL_WINESERVERSOCKET_LINK=NOT_YET
 PTRACE_SAME_PROCESS_MEMORY=NOT_YET
 DEVICE_RUNTIME_TEST=NOT_YET
 
-NEXT_STAGE=ios-server-runtime-patch-set
+NEXT_STAGE=ios-ntdll-native-build
 EOF
 
-# Keep existing workflow markers while this runtime patch-set stage is being
-# completed. New markers above are inspected from the real Action log.
+# Keep existing workflow markers until the workflow gate is intentionally
+# advanced. WINARC_NEXT_ENGINEERING_STAGE carries the real next target.
+log "WINARC_NEXT_ENGINEERING_STAGE=IOS_NTDLL_NATIVE_BUILD"
 log "WINE_SERVER_THREAD_BRIDGE_OBJECT=PASS"
 log "WINE_FULL_IOS_CONFIGURE=SKIPPED"
 log "MADEIRA_ARCHITECTURE_ADAPTED=STATIC_SERVER_AND_THREAD_BOUNDARY"
