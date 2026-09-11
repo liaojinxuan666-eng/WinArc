@@ -38,21 +38,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          grep -F "WINE_HOST_TOOLS=PASS" wine-bootstrap.log
-          grep -F "WINE_IOS_CONFIGURE=PASS" wine-bootstrap.log
-          grep -F "WINE_IOS_SERVER_OBJECTS=PASS" wine-bootstrap.log
-          grep -F "WINE_IOS_SERVER_CORE_LINK=PASS" wine-bootstrap.log
-          grep -F "WINE_INPROC_BRIDGE_COMPILE=PASS" wine-bootstrap.log
-          grep -F "WINE_INPROC_FD_GATE_SOURCE=READY" wine-bootstrap.log
-          grep -F "WINARC_WINE_BOOTSTRAP=PASS" wine-bootstrap.log
-          grep -F "NEXT_STAGE=SERVER_THREAD_AND_SIGNAL_ISOLATION" wine-bootstrap.log
 
-      - name: Upload Wine logs
+          grep -F "JUICE_IOS_SERVER_PATCHES=PASS" wine-bootstrap.log
+          grep -F "WINE_HOST_HEADERS=PASS" wine-bootstrap.log
+          grep -F "WINE_HOST_TOOLS=PASS" wine-bootstrap.log
+
+          grep -F "WINE_IOS_SERVER_SOURCE_COUNT=44" wine-bootstrap.log
+          grep -F "WINE_IOS_SERVER_OBJECT_COMPILE=PASS" wine-bootstrap.log
+          grep -F "WINE_SERVER_THREAD_BRIDGE_OBJECT=PASS" wine-bootstrap.log
+          grep -F "WINE_SERVER_RENAMED_MAIN=PASS" wine-bootstrap.log
+          grep -F "WINE_IOS_SERVER_STATIC_ARCHIVE=PASS" wine-bootstrap.log
+
+          grep -F "WINE_FULL_IOS_CONFIGURE=SKIPPED" wine-bootstrap.log
+          grep -F "MADEIRA_ARCHITECTURE_ADAPTED=STATIC_SERVER_AND_THREAD_BOUNDARY" wine-bootstrap.log
+
+          grep -F "WINARC_WINE_BOOTSTRAP=PASS" wine-bootstrap.log
+          grep -F "NEXT_STAGE=IOS_SERVER_RUNTIME_PATCH_SET" wine-bootstrap.log
+
+      - name: Upload Wine build
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: wine-bootstrap-log
           path: |
             wine-bootstrap.log
+            wine/BASELINE
             wine/build/logs/
+            wine/build/libWinArcWineServer.a
           if-no-files-found: warn
