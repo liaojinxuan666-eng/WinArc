@@ -23,7 +23,7 @@ SERVER_ARCHIVE="$BUILD/libWinArcWineServer.a"
 
 JUICE_REPO="https://github.com/ExoCore-Kernel/Juice.git"
 JUICE_COMMIT="c0de19d93064eac25f87524849e12bb2d49e9a4f"
-BOOTSTRAP_REVISION="4.1"
+BOOTSTRAP_REVISION="4.2"
 MIN_IOS="${WINARC_WINE_MIN_IOS:-14.0}"
 JOBS="${WINARC_JOBS:-2}"
 
@@ -323,8 +323,10 @@ grep -Fq "winarc_wineserver_start_thread_for_gate" "$LOGS/wineserver-ios-nm.txt"
 log "WINE_SERVER_RENAMED_MAIN=PASS"
 log "WINE_IOS_SERVER_STATIC_ARCHIVE=PASS"
 
-# v3's full aarch64-apple-ios Wine configure must stay gone.
-if grep -Fq -- '--host=aarch64-apple-ios' "$0"; then
+# Guard against accidentally restoring v3's full iOS Wine configure route.
+# Construct the pattern in pieces so the guard does not match its own source.
+obsolete_host="$(printf '%s%s' '--host=aarch64-apple-' 'ios')"
+if grep -Fq -- "$obsolete_host" "$0"; then
     die "obsolete full iOS Wine configure route is still present"
 fi
 
