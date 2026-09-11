@@ -19,7 +19,7 @@ GENERATED="$WINE_ROOT/generated"
 
 REV6_COMMIT="f39dbcd7d7e745d271a5fb4f57e851723a892750"
 JUICE_COMMIT="c0de19d93064eac25f87524849e12bb2d49e9a4f"
-BOOTSTRAP_REVISION="7"
+BOOTSTRAP_REVISION="7.1"
 MIN_IOS="${WINARC_WINE_MIN_IOS:-14.0}"
 
 die()
@@ -44,12 +44,16 @@ mkdir -p "$BUILD" "$LOGS" "$GENERATED"
 # ---------------------------------------------------------------------------
 # Gate 0: run the exact Revision 6 script that passed WinArc Run #9.
 #
+# It must be staged inside wine/, not wine/build/, because Revision 6 resolves
+# the repository root relative to its own script location. Keeping the same
+# directory depth preserves all verified paths exactly.
+#
 # Pinning by commit keeps all already-verified wineserver/client code byte-for-
 # byte stable while Revision 7 works only on ntdll. Do not use HEAD^ here:
 # user-side commits between revisions must not change the baseline.
 # ---------------------------------------------------------------------------
 
-REV6_SCRIPT="$BUILD/bootstrap-rev6.sh"
+REV6_SCRIPT="$WINE_ROOT/bootstrap-rev6.sh"
 
 git fetch --quiet origin "$REV6_COMMIT"
 git show "$REV6_COMMIT:wine/bootstrap-wine.sh" > "$REV6_SCRIPT"
