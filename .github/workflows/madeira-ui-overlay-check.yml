@@ -1,0 +1,58 @@
+name: WinArc Madeira UI Overlay Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "app/WinArc/**"
+      - "app/MadeiraOverlay/**"
+      - "app/madeira-ui-overlay.py"
+      - ".github/workflows/madeira-ui-overlay-check.yml"
+
+jobs:
+  overlay:
+    runs-on: macos-15
+    steps:
+      - name: Checkout WinArc
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned Madeira base
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/arjunyerevan95-dot/Madeira.git \
+            "$RUNNER_TEMP/Madeira"
+          git -C "$RUNNER_TEMP/Madeira" checkout \
+            daabd75fc4b09ab32196a2eec010537bf018e108
+
+      - name: Overlay WinArc UI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 app/madeira-ui-overlay.py "$RUNNER_TEMP/Madeira" "$GITHUB_WORKSPACE" \
+            | tee madeira-ui-overlay.log
+          grep -Fx "WINARC_MADEIRA_UI_OVERLAY=PASS" madeira-ui-overlay.log
+          grep -F "struct MadeiraLegacyContentView: View" \
+            "$RUNNER_TEMP/Madeira/app/Madeira/ContentView.swift"
+          grep -F "struct RootView: View" \
+            "$RUNNER_TEMP/Madeira/app/Madeira/ContentView.swift"
+          grep -F "RootView()" \
+            "$RUNNER_TEMP/Madeira/app/Madeira/MadeiraApp.swift"
+
+      - name: Package overlaid Madeira source
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf WinArc-Madeira-UI-overlay.tar.gz \
+            -C "$RUNNER_TEMP/Madeira" app/Madeira app/Madeira.xcodeproj
+
+      - name: Upload overlay source
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinArc-Madeira-UI-overlay
+          path: |
+            WinArc-Madeira-UI-overlay.tar.gz
+            madeira-ui-overlay.log
+          if-no-files-found: error
