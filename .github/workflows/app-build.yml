@@ -20,7 +20,7 @@ on:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 110
 
     steps:
       - name: Checkout WinArc
@@ -44,12 +44,20 @@ jobs:
           echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
           xcodegen --version
 
+      - name: Restore DXMT LLVM cache
+        uses: actions/cache@v4
+        with:
+          path: wine/build/dxmt-llvm
+          key: winarc-dxmt-llvm15-ios-xcode26.3-v1
+
       - name: Build Wine runtime reference
         shell: bash
         run: |
           set -euo pipefail
+
           bison --version
           flex --version
+
           bash wine/bootstrap-wine.sh | tee wine-runtime-bootstrap.log
 
           grep -Fx "WINARC_WINE_BOOTSTRAP_REVISION=9" wine-runtime-bootstrap.log
@@ -58,18 +66,152 @@ jobs:
 
           test -s wine/build/winarc-wine-reference-link/libWinArcWineReference.a
 
+      - name: Build DXMT host backend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REF="$GITHUB_WORKSPACE/wine/build/madeira-wine-reference-src"
+          CACHE="$GITHUB_WORKSPACE/wine/build/dxmt-llvm"
+          GRAPHICS="$GITHUB_WORKSPACE/wine/build/graphics"
+
+          DXMT_ARCHIVE="$REF/app/libdxmt_unix.a"
+
+          test -s "$DXMT_ARCHIVE"
+
+          mkdir -p "$CACHE"
+          mkdir -p "$GRAPHICS"
+
+          if ! test -s "$CACHE/llvm-ios-build/lib/libLLVMPasses.a"; then
+
+            rm -rf \
+              "$CACHE/llvm-project" \
+              "$CACHE/llvm-host-build" \
+              "$CACHE/llvm-ios-build"
+
+            git clone \
+              --depth 1 \
+              --branch llvmorg-15.0.7 \
+              https://github.com/llvm/llvm-project.git \
+              "$CACHE/llvm-project"
+
+            python3 - "$CACHE/llvm-project/llvm/cmake/modules/AddLLVM.cmake" <<'PY'
+          from pathlib import Path
+          import sys
+
+          p = Path(sys.argv[1])
+          s = p.read_text()
+
+          old = 'MATCHES "Darwin"'
+
+          if old not in s:
+              raise SystemExit("LLVM Darwin linker condition not found")
+
+          p.write_text(
+              s.replace(
+                  old,
+                  'MATCHES "Darwin|iOS"'
+              )
+          )
+          PY
+
+            SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+
+            cmake \
+              -S "$CACHE/llvm-project/llvm" \
+              -B "$CACHE/llvm-host-build" \
+              -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+              -DLLVM_TARGETS_TO_BUILD= \
+              -DLLVM_INCLUDE_TESTS=OFF \
+              -DLLVM_INCLUDE_BENCHMARKS=OFF \
+              -DLLVM_INCLUDE_EXAMPLES=OFF \
+              -DLLVM_ENABLE_ZLIB=OFF \
+              -DLLVM_ENABLE_ZSTD=OFF \
+              -DLLVM_ENABLE_LIBXML2=OFF \
+              -DLLVM_ENABLE_TERMINFO=OFF
+
+            cmake \
+              --build "$CACHE/llvm-host-build" \
+              --parallel 3 \
+              --target llvm-tblgen
+
+            cmake \
+              -S "$CACHE/llvm-project/llvm" \
+              -B "$CACHE/llvm-ios-build" \
+              -G Ninja \
+              -DCMAKE_SYSTEM_NAME=iOS \
+              -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+              -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DCMAKE_OSX_SYSROOT="$SDK" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+              -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+              -DLLVM_TABLEGEN="$CACHE/llvm-host-build/bin/llvm-tblgen" \
+              -DLLVM_TARGETS_TO_BUILD= \
+              -DLLVM_BUILD_UTILS=OFF \
+              -DLLVM_BUILD_TOOLS=OFF \
+              -DLLVM_INCLUDE_TOOLS=OFF \
+              -DLLVM_INCLUDE_TESTS=OFF \
+              -DLLVM_INCLUDE_BENCHMARKS=OFF \
+              -DLLVM_INCLUDE_EXAMPLES=OFF \
+              -DLLVM_ENABLE_ZLIB=OFF \
+              -DLLVM_ENABLE_ZSTD=OFF \
+              -DLLVM_ENABLE_LIBXML2=OFF \
+              -DLLVM_ENABLE_TERMINFO=OFF
+
+            cmake \
+              --build "$CACHE/llvm-ios-build" \
+              --parallel 3 \
+              --target LLVMPasses LLVMBitWriter
+          fi
+
+          test -s "$CACHE/llvm-ios-build/lib/libLLVMPasses.a"
+          test -s "$CACHE/llvm-ios-build/lib/libLLVMBitWriter.a"
+
+          rm -f "$GRAPHICS/libWinArcDXMT.a"
+
+          xcrun -sdk iphoneos libtool \
+            -static \
+            -o "$GRAPHICS/libWinArcDXMT.a" \
+            "$DXMT_ARCHIVE" \
+            "$CACHE"/llvm-ios-build/lib/*.a
+
+          test -s "$GRAPHICS/libWinArcDXMT.a"
+
+          xcrun lipo \
+            "$GRAPHICS/libWinArcDXMT.a" \
+            -verify_arch arm64
+
+          xcrun nm \
+            -gU \
+            "$GRAPHICS/libWinArcDXMT.a" \
+            > "$GRAPHICS/dxmt-symbols.txt"
+
+          grep -F \
+            "_dxmt_winemetal_unix_call_funcs" \
+            "$GRAPHICS/dxmt-symbols.txt"
+
+          echo "WINARC_DXMT_HOST_ARCHIVE=PASS"
+
       - name: Generate Xcode project
         shell: bash
         run: |
           set -euo pipefail
+
           cd app
+
           xcodegen generate
+
           test -d WinArc.xcodeproj
 
-      - name: Build WinArc runtime-probe app
+      - name: Build WinArc graphics runtime app
         shell: bash
         run: |
           set -euo pipefail
+
           rm -rf build
 
           xcodebuild \
@@ -84,28 +226,68 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build | tee app-build.log
 
-      - name: Verify final Mach-O contains Wine
+      - name: Verify final Mach-O contains Wine and DXMT
         shell: bash
         run: |
           set -euo pipefail
 
-          APP="$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' | head -1)"
+          APP="$(
+            find \
+              build/DerivedData/Build/Products/Release-iphoneos \
+              -maxdepth 1 \
+              -type d \
+              -name '*.app' \
+              | head -1
+          )"
+
           test -n "$APP"
           test -d "$APP"
 
           BIN="$APP/WinArc"
+
           test -f "$BIN"
 
           xcrun nm "$BIN" > winarc-app-symbols.txt
 
-          grep -F "_winarc_wine_reference_get_boundary" winarc-app-symbols.txt
-          grep -F "_winarc_wine_runtime_is_linked" winarc-app-symbols.txt
-          grep -F "_winarc_wine_runtime_server_entry" winarc-app-symbols.txt
-          grep -F "_winarc_wine_runtime_client_entry" winarc-app-symbols.txt
+          grep -F \
+            "_winarc_wine_reference_get_boundary" \
+            winarc-app-symbols.txt
 
-          grep -E "wineserver_main|__wine_main" winarc-app-symbols.txt || true
+          grep -F \
+            "_winarc_wine_runtime_is_linked" \
+            winarc-app-symbols.txt
+
+          grep -F \
+            "_winarc_wine_runtime_server_entry" \
+            winarc-app-symbols.txt
+
+          grep -F \
+            "_winarc_wine_runtime_client_entry" \
+            winarc-app-symbols.txt
+
+          grep -F \
+            "_dxmt_winemetal_unix_call_funcs" \
+            winarc-app-symbols.txt
+
+          grep -F \
+            "_macdrv_functions" \
+            winarc-app-symbols.txt
+
+          grep -F \
+            "_winarc_graphics_backend_status" \
+            winarc-app-symbols.txt
+
+          test -s "$APP/aarch64-windows/d3d11.dll"
+          test -s "$APP/aarch64-windows/dxgi.dll"
+          test -s "$APP/aarch64-windows/winemetal.dll"
+
+          grep -E \
+            "wineserver_main|__wine_main" \
+            winarc-app-symbols.txt || true
 
           echo "WINARC_APP_WINE_LINK=PASS"
+          echo "WINARC_APP_DXMT_LINK=PASS"
+          echo "WINARC_APP_GRAPHICS_ROUTER=PASS"
           echo "WINARC_APP_WINE_DEVICE_EXECUTION=NOT_RUN"
 
       - name: Package IPA
@@ -113,37 +295,56 @@ jobs:
         run: |
           set -euo pipefail
 
-          APP="$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' | head -1)"
+          APP="$(
+            find \
+              build/DerivedData/Build/Products/Release-iphoneos \
+              -maxdepth 1 \
+              -type d \
+              -name '*.app' \
+              | head -1
+          )"
+
           test -n "$APP"
           test -d "$APP"
 
           rm -rf build/Payload
+
           mkdir -p build/Payload
-          cp -R "$APP" build/Payload/WinArc.app
+
+          cp -R \
+            "$APP" \
+            build/Payload/WinArc.app
 
           (
             cd build
-            /usr/bin/zip -qry WinArc-runtime-probe-unsigned.ipa Payload
+
+            /usr/bin/zip \
+              -qry \
+              WinArc-0.0.1-graphics-unsigned.ipa \
+              Payload
           )
 
-          test -s build/WinArc-runtime-probe-unsigned.ipa
+          test -s \
+            build/WinArc-0.0.1-graphics-unsigned.ipa
+
           echo "WINARC_APP_BUILD=PASS"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: WinArc-runtime-probe-unsigned-ipa
-          path: build/WinArc-runtime-probe-unsigned.ipa
+          name: WinArc-0.0.1-graphics-unsigned-ipa
+          path: build/WinArc-0.0.1-graphics-unsigned.ipa
           if-no-files-found: error
 
       - name: Upload runtime logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: WinArc-runtime-probe-logs
+          name: WinArc-0.0.1-graphics-logs
           path: |
             app-build.log
             wine-runtime-bootstrap.log
             winarc-app-symbols.txt
+            wine/build/graphics/dxmt-symbols.txt
             wine/build/logs/winarc-reference-unresolved.txt
           if-no-files-found: warn
