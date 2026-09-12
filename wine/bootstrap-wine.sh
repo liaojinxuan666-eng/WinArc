@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# WinArc Wine bootstrap - Revision 8
+# WinArc Wine bootstrap - Revision 9
 #
 # Transition build:
-#   1) keep the last verified WinArc/Revision-6 Wine gate as a safety baseline;
+#   1) retain the verified Revision-6 gate as an optional safety check;
 #   2) build ONLY Madeira's Wine dependency stack in an isolated build/reference
 #      directory, pinned to an exact Madeira commit and exact Wine submodule SHA;
-#   3) extract only the native Wine-side archives for WinArc bring-up.
+#   3) isolate server state and relocatably link the native archives.
 #
 # This does NOT turn WinArc into a Madeira fork. Nothing from Madeira's app/UI
 # is copied into the WinArc source tree. The reference checkout is temporary
@@ -26,7 +26,7 @@ LOGS="$BUILD/logs"
 REF_SRC="$BUILD/madeira-wine-reference-src"
 REF_OUT="$BUILD/madeira-wine-reference"
 
-BOOTSTRAP_REVISION="8"
+BOOTSTRAP_REVISION="9"
 
 # Last known-good WinArc Wine boundary, used only as a transition safety gate.
 REV6_COMMIT="f39dbcd7d7e745d271a5fb4f57e851723a892750"
@@ -77,24 +77,31 @@ log "MADEIRA_WINE_PIN=$MADEIRA_WINE_COMMIT"
 # proven in WinArc CI, the workflow will stop rebuilding Revision 6 every run.
 # ---------------------------------------------------------------------------
 
-REV6_SCRIPT="$WINE_ROOT/bootstrap-rev6.sh"
+# Revision 8 already proved the transition. Keep its expensive legacy rebuild
+# available explicitly; the normal gate now checks the current reference link.
+if [[ "${WINARC_VERIFY_LEGACY:-0}" == 1 ]]; then
+    REV6_SCRIPT="$WINE_ROOT/bootstrap-rev6.sh"
 
-git fetch --quiet origin "$REV6_COMMIT"
-git show "$REV6_COMMIT:wine/bootstrap-wine.sh" > "$REV6_SCRIPT"
-chmod +x "$REV6_SCRIPT"
+    git fetch --quiet origin "$REV6_COMMIT"
+    git show "$REV6_COMMIT:wine/bootstrap-wine.sh" > "$REV6_SCRIPT"
+    chmod +x "$REV6_SCRIPT"
 
-grep -Fq 'BOOTSTRAP_REVISION="6"' "$REV6_SCRIPT" || \
-    die "pinned Revision 6 bootstrap marker missing"
+    grep -Fq 'BOOTSTRAP_REVISION="6"' "$REV6_SCRIPT" || \
+        die "pinned Revision 6 bootstrap marker missing"
 
-bash "$REV6_SCRIPT" | tee "$LOGS/revision6-transition-baseline.log"
+    bash "$REV6_SCRIPT" | tee "$LOGS/revision6-transition-baseline.log"
 
-grep -Fq "WINARC_WINE_BOOTSTRAP=PASS" "$LOGS/revision6-transition-baseline.log" || \
-    die "Revision 6 transition baseline failed"
-grep -Fq "WINE_CLIENT_INPROCESS_BRIDGE_COMPILE=PASS" \
-    "$LOGS/revision6-transition-baseline.log" || \
-    die "Revision 6 client/server boundary gate failed"
+    grep -Fq "WINARC_WINE_BOOTSTRAP=PASS" "$LOGS/revision6-transition-baseline.log" || \
+        die "Revision 6 transition baseline failed"
+    grep -Fq "WINE_CLIENT_INPROCESS_BRIDGE_COMPILE=PASS" \
+        "$LOGS/revision6-transition-baseline.log" || \
+        die "Revision 6 client/server boundary gate failed"
 
-log "WINARC_TRANSITION_BASELINE=PASS"
+    log "WINARC_TRANSITION_BASELINE=PASS"
+
+else
+    log "WINARC_TRANSITION_BASELINE=SKIPPED_PREVIOUSLY_VERIFIED"
+fi
 
 # ---------------------------------------------------------------------------
 # Gate 1: exact reference checkout.
@@ -215,15 +222,107 @@ for lib in "${REFERENCE_LIBS[@]}"; do
 done
 
 "$NM" -g "$REF_OUT/libntdll_unix.a" \
-    > "$LOGS/madeira-reference-ntdll-nm.txt" || true
+    > "$LOGS/madeira-reference-ntdll-nm.txt"
 "$NM" -g "$REF_OUT/libwineserver.a" \
-    > "$LOGS/madeira-reference-wineserver-nm.txt" || true
+    > "$LOGS/madeira-reference-wineserver-nm.txt"
 
 grep -Fq "__wine_main" "$LOGS/madeira-reference-ntdll-nm.txt" || \
     die "Madeira reference ntdll archive lacks __wine_main"
 
 log "MADEIRA_WINE_ARCH_ARM64=PASS"
 log "MADEIRA_WINE_NTDLL_WINE_MAIN=PASS"
+
+# ---------------------------------------------------------------------------
+# Gate 5: isolate server/client globals before combining the native archives.
+# Actual Revision-8 artifacts define these names on BOTH sides. Rename every
+# server member, definitions AND references, without modifying the source pin.
+# Use separate output paths so the original reference archives stay intact.
+# ---------------------------------------------------------------------------
+
+LINK_OUT="$BUILD/winarc-wine-reference-link"
+rm -rf "$LINK_OUT"
+mkdir -p "$LINK_OUT/server-objects"
+for lib in "${REFERENCE_LIBS[@]}"; do
+    cp "$REF_OUT/$lib" "$LINK_OUT/$lib"
+done
+
+OBJCOPY="$(brew --prefix llvm)/bin/llvm-objcopy"
+test -x "$OBJCOPY" || die "llvm-objcopy is required for server state isolation"
+AR="$(xcrun --find ar)"
+(
+    cd "$LINK_OUT/server-objects"
+    "$AR" -x "$REF_OUT/libwineserver.a"
+)
+SERVER_STATE=(native_machine server_start_time supported_machines supported_machines_count)
+RENAME_ARGS=()
+for symbol in "${SERVER_STATE[@]}"; do
+    RENAME_ARGS+=(--redefine-sym "_${symbol}=_ws_${symbol}")
+done
+for object in "$LINK_OUT/server-objects/"*.o; do
+    "$OBJCOPY" "${RENAME_ARGS[@]}" "$object"
+done
+rm "$LINK_OUT/libwineserver.a"
+"$AR" -rcs "$LINK_OUT/libwineserver.a" "$LINK_OUT/server-objects/"*.o
+python3 "$WINE_ROOT/check-reference-archives.py" "$LINK_OUT" \
+    --output "$LOGS/winarc-reference-link-audit.json"
+log "WINARC_SERVER_CLIENT_STATE_ISOLATION=PASS"
+
+# ---------------------------------------------------------------------------
+# Gate 6: a real relocatable link, not merely ar concatenation. -all_load makes
+# every member participate so duplicate definitions cannot stay hidden in an
+# unused archive member. Unresolved host/UI/backend imports remain recorded;
+# this object is NOT a runnable app and is NOT final-distribution material.
+# ---------------------------------------------------------------------------
+
+cat > "$LINK_OUT/WinArcWineReferenceBoundary.c" <<'BOUNDARY'
+#include <stdint.h>
+extern int wineserver_main(int argc, char **argv);
+extern void __wine_main(int argc, char **argv);
+struct winarc_wine_reference_boundary {
+    uint32_t abi_version;
+    uint32_t runtime_ready;
+    int (*server_entry)(int, char **);
+    void (*client_entry)(int, char **);
+};
+/* Expose real entry addresses for later integration; do not run Wine from a
+ * constructor or claim that link success establishes process initialization. */
+__attribute__((visibility("default")))
+const struct winarc_wine_reference_boundary *winarc_wine_reference_get_boundary(void)
+{
+    static const struct winarc_wine_reference_boundary boundary = {
+        1, 0, wineserver_main, __wine_main
+    };
+    return &boundary;
+}
+BOUNDARY
+
+SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
+xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK_PATH" \
+    -miphoneos-version-min=17.0 -std=c11 -Wall -Wextra -Werror \
+    -c "$LINK_OUT/WinArcWineReferenceBoundary.c" -o "$LINK_OUT/boundary.o"
+LINK_INPUTS=()
+for lib in "${REFERENCE_LIBS[@]}"; do LINK_INPUTS+=("$LINK_OUT/$lib"); done
+xcrun --sdk iphoneos ld -r -arch arm64 \
+    -platform_version ios 17.0 "$SDK_VERSION" \
+    -all_load "$LINK_OUT/boundary.o" "${LINK_INPUTS[@]}" \
+    -o "$LINK_OUT/WinArcWineReference.o" \
+    2>&1 | tee "$LOGS/winarc-reference-relocatable-link.log"
+"$LIPO" "$LINK_OUT/WinArcWineReference.o" -verify_arch arm64
+"$NM" -g -U "$LINK_OUT/WinArcWineReference.o" > "$LOGS/winarc-reference-defined.txt"
+for symbol in _winarc_wine_reference_get_boundary _wineserver_main ___wine_main _win32u_unix_lib_init; do
+    awk '{print $NF}' "$LOGS/winarc-reference-defined.txt" | grep -Fx "$symbol" >/dev/null || \
+        die "linked reference object lacks definition $symbol"
+done
+"$NM" -u "$LINK_OUT/WinArcWineReference.o" > "$LOGS/winarc-reference-unresolved.txt"
+"$AR" -rcs "$LINK_OUT/libWinArcWineReference.a" "$LINK_OUT/WinArcWineReference.o"
+tar -czf "$LOGS/WinArc-Wine-Reference-Link.tar.gz" -C "$LINK_OUT" \
+    libWinArcWineReference.a WinArcWineReferenceBoundary.c
+shasum -a 256 "$LOGS/WinArc-Wine-Reference-Link.tar.gz" \
+    > "$LOGS/WinArc-Wine-Reference-Link.sha256"
+log "WINARC_WINE_RELOCATABLE_LINK=PASS"
+log "WINARC_WINE_EXECUTABLE_LINK=NOT_RUN"
+log "WINARC_WINE_RUNTIME_EXECUTION=NOT_RUN"
 
 # Keep a single tarball under logs so the current WinArc workflow uploads it
 # without requiring a workflow edit during this transition.
@@ -265,12 +364,15 @@ DXMT_FIRST_VERSION=PLANNED
 D3DMETAL_BACKEND=PLANNED
 ALLOYCORE=RETAINED
 
-NEXT_STAGE=link-madeira-wine-reference-into-winarc-bringup
+REFERENCE_RELOCATABLE_LINK=PASS
+REFERENCE_EXECUTABLE_LINK=NOT_RUN
+RUNTIME_EXECUTION=NOT_RUN
+NEXT_STAGE=implement-host-boundary-and-strict-executable-link
 EOF
 
 log "WINARC_PRODUCT_INDEPENDENCE=PASS"
 log "MADEIRA_APP_IMPORTED=NO"
 log "MADEIRA_WINE_REFERENCE_ONLY=PASS"
 log "WINARC_WINE_REFERENCE_BUILD=PASS"
-log "WINARC_NEXT_ENGINEERING_STAGE=MADEIRA_WINE_REFERENCE_LINK"
+log "WINARC_NEXT_ENGINEERING_STAGE=HOST_BOUNDARY_EXECUTABLE_LINK"
 log "WINARC_WINE_BOOTSTRAP=PASS"

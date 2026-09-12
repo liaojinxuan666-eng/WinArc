@@ -23,7 +23,33 @@ Current engineering stage:
 MADEIRA_WINE_REFERENCE_LINK
 ```
 
-Next step: link the proven Wine native archives into WinArc's own in-process bring-up boundary, then move toward the first usable WinArc version.
+Revision 9 adds the next link gate (iPhoneOS CI validation pending):
+
+- Isolate four server globals from the NTDLL client copies: `native_machine`,
+  `server_start_time`, `supported_machines`, and `supported_machines_count`.
+  Rewrite both definitions and references in a separate copy of the server archive.
+- Inspect every archive member for ARM64/iPhoneOS, defined entry symbols,
+  duplicate external state, and remaining imports.
+- Force-load all seven reference archives into a relocatable Mach-O object
+  together with WinArc's own entry-address boundary. Package the result as
+  `libWinArcWineReference.a` for internal integration.
+- Keep executable linking and runtime execution explicitly **NOT_RUN**.
+  A relocatable link permits unresolved imports; it is not a runnable app.
+- Stop rebuilding the already-verified Revision 6 baseline on every CI run.
+  `WINARC_VERIFY_LEGACY=1 bash wine/bootstrap-wine.sh` retains that optional check.
+
+The archive audit was checked against the actual Revision 8 CI artifacts:
+all four state collisions were detected before isolation and absent afterward.
+The remaining imports include Apple system functions and missing host/display/
+DXMT hooks; they are recorded in `winarc-reference-link-audit.json` and, after
+linking, `winarc-reference-unresolved.txt`. They are not replaced with success stubs.
+
+Next: implement the host boundary and pass a strict executable link before
+attempting Wine process startup. Juice and upstream Wine remain references
+for the compatible final implementation; Madeira app/UI code is not imported.
+
+Local validation: `python3 -m unittest discover -s tests -p 'test_*.py'`.
+The existing `wine/bootstrap-wine.sh` remains the only build entry point.
 
 ## Wine strategy
 
