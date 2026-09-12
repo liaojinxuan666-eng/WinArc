@@ -1,21 +1,21 @@
 /*
  * WinArc iOS display shim for DXMT.
  *
- * Kept deliberately small: DXMT needs the macdrv-shaped export table to
- * resolve an HWND to a CAMetalLayer. WinArc owns the layer and registers it
- * through winarc_display_set_layer().
- *
- * Compared with the reference implementation, the temporary win-data object
- * is thread-local (no cross-thread HWND race) and the registered layer is
- * retained/released under a mutex instead of storing an unowned pointer.
+ * Fullscreen/direct-game mode uses a registered CAMetalLayer.
+ * Wine desktop mode resolves each HWND to Winios' per-window CAMetalLayer.
  */
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
-#import <pthread.h>
+
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "IOSDisplayShim.h"
+#include "Winios.h"
 
 typedef struct macdrv_opaque_metal_device *macdrv_metal_device;
 typedef struct macdrv_opaque_metal_view   *macdrv_metal_view;
@@ -48,32 +48,38 @@ struct macdrv_functions_t
 };
 
 static pthread_mutex_t g_layer_lock = PTHREAD_MUTEX_INITIALIZER;
-static CAMetalLayer *g_layer = nil;
+static CAMetalLayer *g_fullscreen_layer = nil;
 
 void winarc_display_set_layer(CAMetalLayer *layer)
 {
     pthread_mutex_lock(&g_layer_lock);
 
-    if (layer != g_layer)
+    if (layer != g_fullscreen_layer)
     {
         if (layer) CFRetain((__bridge CFTypeRef)layer);
-        if (g_layer) CFRelease((__bridge CFTypeRef)g_layer);
-        g_layer = layer;
+        if (g_fullscreen_layer)
+            CFRelease((__bridge CFTypeRef)g_fullscreen_layer);
+
+        g_fullscreen_layer = layer;
     }
 
     pthread_mutex_unlock(&g_layer_lock);
 }
 
-/* A per-thread object avoids racing the HWND field when Wine creates or
- * destroys swapchains on more than one thread. */
 static _Thread_local struct macdrv_win_data g_win_data;
 
 static struct macdrv_win_data *winarc_get_win_data(HWND hwnd)
 {
     g_win_data.hwnd = hwnd;
     g_win_data.cocoa_window = NULL;
+
+    /*
+     * The iOS DXMT shim only needs a stable token that identifies the Wine
+     * window. Reusing HWND avoids a second cross-thread mapping table.
+     */
     g_win_data.cocoa_view = (macdrv_view)hwnd;
     g_win_data.client_cocoa_view = (macdrv_view)hwnd;
+
     return &g_win_data;
 }
 
@@ -92,26 +98,48 @@ static void winarc_release_metal_device(macdrv_metal_device device)
     (void)device;
 }
 
-static macdrv_metal_view
-winarc_create_metal_view(macdrv_view view, macdrv_metal_device device)
+static CAMetalLayer *winarc_layer_for_view(macdrv_view view)
 {
-    (void)view;
-    (void)device;
+    const char *desktop = getenv("WINARC_DESKTOP");
+
+    if (desktop && desktop[0] == '1')
+        return winios_metal_layer_for_hwnd((void *)view);
 
     pthread_mutex_lock(&g_layer_lock);
-    CAMetalLayer *layer = g_layer;
 
+    CAMetalLayer *layer = g_fullscreen_layer;
     if (layer)
         CFRetain((__bridge CFTypeRef)layer);
 
     pthread_mutex_unlock(&g_layer_lock);
 
+    return layer;
+}
+
+static macdrv_metal_view
+winarc_create_metal_view(macdrv_view view, macdrv_metal_device device)
+{
+    (void)device;
+
+    CAMetalLayer *layer = winarc_layer_for_view(view);
+
     if (!layer)
     {
         fprintf(stderr,
-                "[WinArc/DXMT] CAMetalLayer requested before registration\n");
+                "[WinArc/DXMT] no CAMetalLayer for view=%p desktop=%s\n",
+                view,
+                getenv("WINARC_DESKTOP") ? getenv("WINARC_DESKTOP") : "0");
         return NULL;
     }
+
+    /*
+     * Winios returns an unretained layer; fullscreen mode already retained it
+     * inside winarc_layer_for_view(). Make both modes obey the same ownership
+     * contract expected by macdrv_view_release_metal_view().
+     */
+    const char *desktop = getenv("WINARC_DESKTOP");
+    if (desktop && desktop[0] == '1')
+        CFRetain((__bridge CFTypeRef)layer);
 
     return (macdrv_metal_view)(__bridge void *)layer;
 }
@@ -138,11 +166,6 @@ static void winarc_on_main_thread(dispatch_block_t block)
         dispatch_async(dispatch_get_main_queue(), block);
 }
 
-/*
- * These are found through dlsym(RTLD_DEFAULT, ...), not a normal C reference.
- * `used` prevents Release dead stripping and default visibility keeps them in
- * the export trie.
- */
 __attribute__((used, visibility("default")))
 struct macdrv_functions_t macdrv_functions = {
     .macdrv_init_display_devices = NULL,

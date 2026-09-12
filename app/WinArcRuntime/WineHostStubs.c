@@ -1,9 +1,9 @@
 /*
  * WinArc Wine host boundary.
  *
- * WinArc 0.0.1 device bring-up. wineserver already runs in-process.
- * Graphics now uses a weak DXMT fallback so the real, strong DXMT winemetal
- * call table can replace it as soon as libWinArcDXMT.a is linked.
+ * Winios rendering lives in Winios.m. This file only contains process-level
+ * host shims and compatibility counters required by the current DXMT/Wine
+ * reference objects.
  */
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -40,7 +40,7 @@ void fatal_error(const char *format, ...)
 
     va_start(args, format);
     vsnprintf(buffer, sizeof(buffer),
-              format ? format : "unknown wineserver fatal error",
+              format ? format : "unknown Wine fatal error",
               args);
     va_end(args);
 
@@ -49,7 +49,10 @@ void fatal_error(const char *format, ...)
 
     winarc_wine_runtime_report_fatal(buffer);
 
-    /* wineserver and UIKit share one Mach process. */
+    /*
+     * Wine and UIKit share one Mach process. A fatal Wine worker must never
+     * terminate WinArc itself.
+     */
     pthread_exit(NULL);
 }
 
@@ -74,127 +77,19 @@ CFDictionaryRef IOPSGetPowerSourceDescription(CFTypeRef blob, CFTypeRef source)
 }
 
 /*
- * Important: DXMT defines this as
+ * Current DXMT's present-cadence diagnostics reference these counters from
+ * Madeira's instrumented ntdll build. WinArc's reference archive does not
+ * export every diagnostic counter, so provide weak zero-value fallbacks.
+ * If a later Wine build exports the real counters, its strong definitions win.
  *
- *     const void *dxmt_winemetal_unix_call_funcs[]
- *
- * Do not use the old `void *... = NULL` strong placeholder. A strong fake
- * definition collides with — or masks — the real table. This weak one-element
- * array is replaced by DXMT's strong definition at final link.
+ * Exact types match the upstream instrumented sources:
+ *   ios_exc_msg_count                         -> int
+ *   ios_srv_*_count / timeouts / req_count   -> int
+ *   ios_srv_wait_us / wait_req_us             -> long long
  */
-__attribute__((weak))
-const void *dxmt_winemetal_unix_call_funcs[] = { NULL };
-
-int winios_pCreateWindow(void *hwnd)
-{
-    (void)hwnd;
-    return 1;
-}
-
-int winios_pProcessEvents(unsigned long mask)
-{
-    (void)mask;
-    return 1;
-}
-
-void winios_pSetCursor(void *hwnd, void *cursor)
-{
-    (void)hwnd;
-    (void)cursor;
-}
-
-void winios_pDestroyCursorIcon(void *cursor)
-{
-    (void)cursor;
-}
-
-void winios_pDestroyWindow(void *hwnd)
-{
-    (void)hwnd;
-}
-
-unsigned int winios_pShowWindow(void *hwnd, int command, void *rect, unsigned int swp)
-{
-    (void)hwnd;
-    (void)command;
-    (void)rect;
-    (void)swp;
-    return 1;
-}
-
-void winios_pWindowPosChanged(void *hwnd,
-                              void *insert_after,
-                              void *owner_hint,
-                              unsigned int swp_flags,
-                              const void *new_rects,
-                              void *surface)
-{
-    (void)hwnd;
-    (void)insert_after;
-    (void)owner_hint;
-    (void)swp_flags;
-    (void)new_rects;
-    (void)surface;
-}
-
-void winios_surface_present(void *hwnd,
-                            int dirty_x, int dirty_y, int dirty_w, int dirty_h,
-                            int surface_w, int surface_h, int stride,
-                            const void *bits)
-{
-    (void)hwnd;
-    (void)dirty_x;
-    (void)dirty_y;
-    (void)dirty_w;
-    (void)dirty_h;
-    (void)surface_w;
-    (void)surface_h;
-    (void)stride;
-    (void)bits;
-}
-
-void winios_window_frame(void *hwnd,
-                         int x, int y, int w, int h, int visible,
-                         int client_x, int client_y, int client_w, int client_h)
-{
-    (void)hwnd;
-    (void)x;
-    (void)y;
-    (void)w;
-    (void)h;
-    (void)visible;
-    (void)client_x;
-    (void)client_y;
-    (void)client_w;
-    (void)client_h;
-}
-
-void winios_cursor_set(unsigned int id,
-                       int w, int h, int hot_x, int hot_y,
-                       const void *bgra)
-{
-    (void)id;
-    (void)w;
-    (void)h;
-    (void)hot_x;
-    (void)hot_y;
-    (void)bgra;
-}
-
-void winios_cursor_show(int show)
-{
-    (void)show;
-}
-
-void winios_dump_srcbits(const void *bits, int w, int h, int stride)
-{
-    (void)bits;
-    (void)w;
-    (void)h;
-    (void)stride;
-}
-
-void winios_phase(const char *name)
-{
-    (void)name;
-}
+__attribute__((weak)) volatile int ios_exc_msg_count = 0;
+__attribute__((weak)) volatile int ios_srv_req_count = 0;
+__attribute__((weak)) volatile int ios_srv_wait_count = 0;
+__attribute__((weak)) volatile int ios_srv_wait_timeouts = 0;
+__attribute__((weak)) volatile long long ios_srv_wait_us = 0;
+__attribute__((weak)) volatile long long ios_srv_wait_req_us = 0;

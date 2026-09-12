@@ -48,6 +48,35 @@ struct HomeView: View {
 
                 RuntimeStatusView()
 
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Label("Wine Desktop", systemImage: "rectangle.on.rectangle")
+                            .font(.system(size: 16, weight: .semibold))
+
+                        Spacer()
+
+                        Text("1280 × 720")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(WinArcTheme.secondary)
+                    }
+
+                    WineDesktopSurfaceView()
+                        .frame(minHeight: 260, idealHeight: 340, maxHeight: 420)
+                        .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                        .background(.black)
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .stroke(.white.opacity(0.08), lineWidth: 1)
+                        }
+
+                    Text("启动 wineserver 后再点“启动 Wine 桌面”。这里直接显示 Winios 合成结果。")
+                        .font(.caption)
+                        .foregroundStyle(WinArcTheme.secondary)
+                }
+                .padding(18)
+                .winArcGlass()
+
                 if store.games.isEmpty {
                     HStack(spacing: 16) {
                         Image(systemName: "gamecontroller.fill")

@@ -46,11 +46,11 @@ targets:
           $(inherited)
           -force_load
           $(SRCROOT)/../wine/build/winarc-wine-reference-link/libWinArcWineReference.a
-          -force_load
           $(SRCROOT)/../wine/build/graphics/libWinArcDXMT.a
           -lc++
           -lsqlite3
           -framework CoreFoundation
+          -framework CoreGraphics
           -framework CoreText
           -framework AudioToolbox
           -framework AVFoundation
@@ -61,7 +61,7 @@ targets:
           -framework QuartzCore
 
     postBuildScripts:
-      - name: Stage Wine and Graphics Runtime
+      - name: Stage Wine Runtime
         script: |
           set -euo pipefail
 
@@ -74,11 +74,22 @@ targets:
           PE_SRC="${REF_APP}/aarch64-windows"
           PE_DST="${APP_RES}/aarch64-windows"
 
+          PREFIX_ARCHIVE="${REF_APP}/prefix-template.tar.gz"
+          PREFIX_DST="${APP_RES}/WinArcPrefixTemplate"
+          PREFIX_TMP="${TARGET_TEMP_DIR}/winarc-prefix-template"
+
           test -d "${NLS_SRC}"
           test -d "${PE_SRC}"
+          test -s "${PREFIX_ARCHIVE}"
 
-          # DXMT PE side. These are the exact modules paired with the iOS
-          # winemetal host side that is statically linked into WinArc.
+          test -s "${PE_SRC}/ntdll.dll"
+          test -s "${PE_SRC}/kernel32.dll"
+          test -s "${PE_SRC}/user32.dll"
+          test -s "${PE_SRC}/explorer.exe"
+
+          # DXMT stays available, but it is no longer force-loaded wholesale.
+          # The static linker pulls only the objects actually required by the
+          # selected runtime path.
           test -s "${PE_SRC}/d3d11.dll"
           test -s "${PE_SRC}/dxgi.dll"
           test -s "${PE_SRC}/winemetal.dll"
@@ -91,15 +102,33 @@ targets:
           rm -rf "${PE_DST}"
           /usr/bin/ditto "${PE_SRC}" "${PE_DST}"
 
+          rm -rf "${PREFIX_TMP}" "${PREFIX_DST}"
+          mkdir -p "${PREFIX_TMP}" "${PREFIX_DST}"
+
+          /usr/bin/tar -xzf "${PREFIX_ARCHIVE}" -C "${PREFIX_TMP}"
+
+          DRIVE_C="$(
+            find "${PREFIX_TMP}" -maxdepth 4 -type d -name drive_c -print -quit
+          )"
+          test -n "${DRIVE_C}"
+
+          PREFIX_ROOT="$(dirname "${DRIVE_C}")"
+          /usr/bin/ditto "${PREFIX_ROOT}" "${PREFIX_DST}"
+
+          test -d "${PREFIX_DST}/drive_c"
+          test -f "${PREFIX_DST}/system.reg"
+          test -f "${PREFIX_DST}/user.reg"
+
+          test -s "${PE_DST}/explorer.exe"
           test -s "${PE_DST}/d3d11.dll"
           test -s "${PE_DST}/dxgi.dll"
           test -s "${PE_DST}/winemetal.dll"
 
-          echo "WINARC_WINE_NLS_BUNDLED=PASS"
-          echo "WINARC_DXMT_PE_RUNTIME_BUNDLED=PASS"
-
-          # D3DMetal is a first-class WinArc backend, but its Apple framework
-          # is intentionally NOT copied from the internet or from Madeira.
-          # If a compatible payload is later provided at this path, WinArc's
-          # GraphicsBackendBridge will validate it at runtime.
+          # D3DMetal remains a first-class backend slot. A compatible iOS
+          # payload is validated by GraphicsBackendBridge when present.
           mkdir -p "${APP_RES}/Graphics/D3DMetal"
+
+          echo "WINARC_WINE_NLS_BUNDLED=PASS"
+          echo "WINARC_WINE_PREFIX_TEMPLATE_BUNDLED=PASS"
+          echo "WINARC_WINE_EXPLORER_BUNDLED=PASS"
+          echo "WINARC_DXMT_PE_RUNTIME_BUNDLED=PASS"

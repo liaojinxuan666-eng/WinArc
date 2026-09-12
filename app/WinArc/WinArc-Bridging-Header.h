@@ -4,5 +4,6 @@
 #include "../WinArcRuntime/WineRuntimeBridge.h"
 #include "../WinArcRuntime/GraphicsBackendBridge.h"
 #include "../WinArcRuntime/IOSDisplayShim.h"
+#include "../WinArcRuntime/Winios.h"
 
 #endif
