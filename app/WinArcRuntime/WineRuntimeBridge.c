@@ -343,7 +343,15 @@ int winarc_wine_runtime_start_server(const char *prefix_path,
 
     setenv("WINEPREFIX", prefix_path, 1);
     setenv("HOME", prefix_path, 1);
+
+    /*
+     * The current iOS Wine/win32u objects still use Madeira's internal
+     * environment gates. Keep our public WinArc name too, but do not rename
+     * the donor-side gate until the corresponding Wine sources move over.
+     */
     setenv("WINARC_DESKTOP", "1", 1);
+    setenv("MADEIRA_DESKTOP", "1", 1);
+    setenv("MADEIRA_WIN32U", "1", 1);
 
     wineserver_set_nls_dir(nls_path);
 
@@ -389,6 +397,11 @@ static void *client_thread_main(void *unused)
 {
     const struct winarc_wine_reference_boundary *value = boundary();
 
+#if defined(__APPLE__)
+    /* Guest main thread: avoid default-QoS timer coalescing during Wine init. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+
     char *argv[] = {
         (char *)"wine",
         (char *)"C:\\windows\\system32\\explorer.exe",
@@ -410,8 +423,37 @@ static void *client_thread_main(void *unused)
 
     setenv("WINEPREFIX", g_client_context.prefix, 1);
     setenv("HOME", g_client_context.prefix, 1);
+
+    /*
+     * LOAD-BEARING on iOS:
+     *
+     * Wine's __wine_main() normally calls check_command_line(), which reaches
+     * reexec_loader(). A normal Unix Wine process may re-exec its loader; an
+     * iOS app must remain inside the existing UIKit Mach process.
+     *
+     * The iOS Wine reference explicitly relies on WINELOADERNOEXEC=1 to skip
+     * that path. __wine_main() consumes and unsets it itself.
+     */
+    setenv("WINELOADERNOEXEC", "1", 1);
+
+    /*
+     * The current donor win32u build still checks these internal Madeira
+     * switches. WINARC_DESKTOP is our app-side switch; MADEIRA_DESKTOP is
+     * required by driver_ios.c until that Wine-side source is renamed.
+     */
     setenv("WINARC_DESKTOP", "1", 1);
+    setenv("MADEIRA_DESKTOP", "1", 1);
+    setenv("MADEIRA_WIN32U", "1", 1);
+
+    /*
+     * Match the proven iOS loader contract: WINEDLLPATH points at the App
+     * bundle root, which contains aarch64-windows/. Do not point it directly
+     * at aarch64-windows; Wine's loader appends the PE architecture directory.
+     */
     setenv("WINEDLLPATH", g_client_context.bundle, 1);
+
+    /* Keep desktop bring-up quiet enough to see genuine bootstrap failures. */
+    setenv("WINEDEBUG", "err+all,err-virtual", 1);
 
     /*
      * Desktop bring-up does not initialize DXMT or D3DMetal. The shell is a
@@ -521,8 +563,18 @@ int winarc_wine_runtime_start_desktop(const char *prefix_path,
     snprintf(pe_path, sizeof(pe_path),
              "%s/aarch64-windows", bundle_path);
 
+    /*
+     * Keep this sanity check local, but retain the BUNDLE ROOT in the client
+     * context. Wine's iOS loader derives aarch64-windows/ from WINEDLLPATH.
+     */
+    if (access(pe_path, R_OK) != 0)
+    {
+        set_last_error("aarch64-windows runtime is unavailable");
+        return -3;
+    }
+
     snprintf(g_client_context.bundle,
-             sizeof(g_client_context.bundle), "%s", pe_path);
+             sizeof(g_client_context.bundle), "%s", bundle_path);
 
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0)
     {
