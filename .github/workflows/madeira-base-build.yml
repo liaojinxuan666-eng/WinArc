@@ -18,10 +18,14 @@ jobs:
     name: Build Madeira ${{ matrix.component }}
     runs-on: macos-15
     timeout-minutes: 150
+
     strategy:
       fail-fast: false
       matrix:
-        component: [fex, llvm, wine]
+        component:
+          - fex
+          - llvm
+          - wine
 
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -40,7 +44,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           brew install cmake ninja
+
           if [ "${{ matrix.component }}" = "wine" ]; then
             brew install bison llvm gnutls pkg-config
           fi
@@ -49,22 +55,44 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           M="$RUNNER_TEMP/Madeira"
-          git clone --filter=blob:none --no-checkout \
-            https://github.com/arjunyerevan95-dot/Madeira.git "$M"
+
+          rm -rf "$M"
+
+          git clone \
+            --filter=blob:none \
+            --no-checkout \
+            https://github.com/arjunyerevan95-dot/Madeira.git \
+            "$M"
+
           git -C "$M" checkout "$MADEIRA_COMMIT"
-          test "$(git -C "$M" rev-parse HEAD)" = "$MADEIRA_COMMIT"
+
+          test \
+            "$(git -C "$M" rev-parse HEAD)" \
+            = "$MADEIRA_COMMIT"
 
       - name: Build ${{ matrix.component }}
         shell: bash
         run: |
           set -euo pipefail
+
           M="$RUNNER_TEMP/Madeira"
+
           cd "$M"
-          bash scripts/ci-build-dependency.sh "${{ matrix.component }}" \
-            2>&1 | tee "ci-output/${{ matrix.component }}-build.log"
-          test -s "ci-output/${{ matrix.component }}-ios.tar.gz"
-          test -s "ci-output/${{ matrix.component }}-sha256.txt"
+
+          mkdir -p ci-output
+
+          bash scripts/ci-build-dependency.sh \
+            "${{ matrix.component }}" \
+            2>&1 | tee \
+            "ci-output/${{ matrix.component }}-build.log"
+
+          test -s \
+            "ci-output/${{ matrix.component }}-ios.tar.gz"
+
+          test -s \
+            "ci-output/${{ matrix.component }}-sha256.txt"
 
       - name: Upload ${{ matrix.component }} package
         uses: actions/upload-artifact@v4
@@ -81,6 +109,7 @@ jobs:
   app:
     name: Build WinArc app on Madeira
     needs: dependencies
+
     runs-on: macos-15
     timeout-minutes: 120
 
@@ -97,42 +126,66 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           test -d "$DEVELOPER_DIR"
+
           xcodebuild -version
 
       - name: Install app build tools
         shell: bash
         run: |
           set -euo pipefail
+
           brew install cmake ninja
 
       - name: Checkout pinned Madeira base
         shell: bash
         run: |
           set -euo pipefail
+
           M="$RUNNER_TEMP/Madeira"
-          git clone --filter=blob:none --no-checkout \
-            https://github.com/arjunyerevan95-dot/Madeira.git "$M"
+
+          rm -rf "$M"
+
+          git clone \
+            --filter=blob:none \
+            --no-checkout \
+            https://github.com/arjunyerevan95-dot/Madeira.git \
+            "$M"
+
           git -C "$M" checkout "$MADEIRA_COMMIT"
-          test "$(git -C "$M" rev-parse HEAD)" = "$MADEIRA_COMMIT"
+
+          test \
+            "$(git -C "$M" rev-parse HEAD)" \
+            = "$MADEIRA_COMMIT"
 
       - name: Attach WinArc UI to Madeira app
         shell: bash
         run: |
           set -euo pipefail
+
           M="$RUNNER_TEMP/Madeira"
-          python3 app/madeira-ui-overlay.py "$M" "$GITHUB_WORKSPACE" \
+
+          python3 \
+            app/madeira-ui-overlay.py \
+            "$M" \
+            "$GITHUB_WORKSPACE" \
             | tee madeira-ui-overlay.log
 
-          grep -Fx "WINARC_MADEIRA_UI_OVERLAY=PASS" madeira-ui-overlay.log
+          grep -Fx \
+            "WINARC_MADEIRA_UI_OVERLAY=PASS" \
+            madeira-ui-overlay.log
 
-          grep -F "struct MadeiraLegacyContentView: View" \
+          grep -F \
+            "struct MadeiraLegacyContentView: View" \
             "$M/app/Madeira/ContentView.swift"
 
-          grep -F "struct RootView: View" \
+          grep -F \
+            "struct RootView: View" \
             "$M/app/Madeira/ContentView.swift"
 
-          grep -F "RootView()" \
+          grep -F \
+            "RootView()" \
             "$M/app/Madeira/MadeiraApp.swift"
 
       - name: Download Madeira FEX package
@@ -157,30 +210,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           M="$RUNNER_TEMP/Madeira"
 
           for component in fex llvm wine; do
-            test -s "$M/build-inputs/$component/$component-ios.tar.gz"
-            test -s "$M/build-inputs/$component/$component-sha256.txt"
+            test -s \
+              "$M/build-inputs/$component/$component-ios.tar.gz"
+
+            test -s \
+              "$M/build-inputs/$component/$component-sha256.txt"
           done
 
       - name: Build complete Madeira runtime with WinArc UI
         shell: bash
         run: |
           set -euo pipefail
+
           M="$RUNNER_TEMP/Madeira"
 
-          python3 - "$M/scripts/ci-build-app.sh" <<'PY'
+          python3 - \
+            "$M/scripts/ci-build-app.sh" <<'PY'
           from pathlib import Path
           import sys
 
           p = Path(sys.argv[1])
+
           s = p.read_text()
 
           old = "PRODUCT_BUNDLE_IDENTIFIER=com.madeira.emulator"
 
           if old not in s:
-              raise SystemExit("Madeira bundle-id build argument changed")
+              raise SystemExit(
+                  "Madeira bundle-id build argument changed"
+              )
 
           p.write_text(
               s.replace(
@@ -193,10 +255,14 @@ jobs:
 
           cd "$M"
 
-          bash scripts/ci-build-app.sh \
-            2>&1 | tee ci-output/winarc-app-build.log
+          mkdir -p ci-output
 
-          test -s ci-output/Madeira-unsigned.ipa
+          bash scripts/ci-build-app.sh \
+            2>&1 | tee \
+            ci-output/winarc-app-build.log
+
+          test -s \
+            ci-output/Madeira-unsigned.ipa
 
       - name: Repackage as WinArc IPA
         shell: bash
@@ -208,19 +274,22 @@ jobs:
           OUT="$GITHUB_WORKSPACE/WinArc-Madeira-base-unsigned.ipa"
 
           rm -rf "$P"
+
           mkdir -p "$P"
 
           unzip -q \
             "$M/ci-output/Madeira-unsigned.ipa" \
             -d "$P"
 
-          test -d "$P/Payload/Madeira.app"
+          test -d \
+            "$P/Payload/Madeira.app"
 
           mv \
             "$P/Payload/Madeira.app" \
             "$P/Payload/WinArc.app"
 
-          test -s "$P/Payload/WinArc.app/Madeira"
+          test -s \
+            "$P/Payload/WinArc.app/Madeira"
 
           DISPLAY="$(
             /usr/libexec/PlistBuddy \
@@ -234,12 +303,21 @@ jobs:
               "$P/Payload/WinArc.app/Info.plist"
           )"
 
-          test "$DISPLAY" = "WinArc"
-          test "$BUNDLE_ID" = "com.winarc.app"
+          test \
+            "$DISPLAY" \
+            = "WinArc"
+
+          test \
+            "$BUNDLE_ID" \
+            = "com.winarc.app"
 
           (
             cd "$P"
-            /usr/bin/zip -qry "$OUT" Payload
+
+            /usr/bin/zip \
+              -qry \
+              "$OUT" \
+              Payload
           )
 
           test -s "$OUT"
