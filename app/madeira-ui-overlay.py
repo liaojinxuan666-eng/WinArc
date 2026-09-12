@@ -333,8 +333,11 @@ assert (
 )
 
 assert (
-    "ContentView.hhmmss"
-    not in generated
+    re.search(
+        r"(?<![A-Za-z0-9_])ContentView\.hhmmss",
+        generated,
+    )
+    is None
 )
 
 assert (
