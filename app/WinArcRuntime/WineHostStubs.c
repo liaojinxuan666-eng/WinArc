@@ -1,9 +1,9 @@
 /*
  * WinArc Wine host boundary.
  *
- * WinArc 0.0.1 is now entering the first device-execution bring-up stage:
- * wineserver may run as a pthread, while the Windows client is still disabled.
- * Display/DXMT callbacks remain inert until the client path is enabled.
+ * WinArc 0.0.1 device bring-up. wineserver already runs in-process.
+ * Graphics now uses a weak DXMT fallback so the real, strong DXMT winemetal
+ * call table can replace it as soon as libWinArcDXMT.a is linked.
  */
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -15,21 +15,12 @@
 #include <stdint.h>
 #include <stdio.h>
 
-/* Report a server-side fatal startup error back to the Swift status panel. */
 extern void winarc_wine_runtime_report_fatal(const char *message);
-
-/* ------------------------------------------------------------------------- */
-/* Wine/iOS process-exit state expected by the ntdll iOS exit shim.           */
-/* ------------------------------------------------------------------------- */
 
 _Thread_local jmp_buf wine_ios_exit_jmpbuf;
 _Thread_local volatile int wine_ios_exit_code = 0;
 _Thread_local pthread_t wine_ios_main_thread;
 _Thread_local int wine_ios_exit_initialized = 0;
-
-/* ------------------------------------------------------------------------- */
-/* iOS instruction-cache bridge.                                              */
-/* ------------------------------------------------------------------------- */
 
 void __clear_cache(void *start, void *end)
 {
@@ -39,10 +30,6 @@ void __clear_cache(void *start, void *end)
     if (!begin || finish <= begin) return;
     sys_icache_invalidate((void *)begin, (size_t)(finish - begin));
 }
-
-/* ------------------------------------------------------------------------- */
-/* wineserver host state.                                                     */
-/* ------------------------------------------------------------------------- */
 
 volatile int g_wineserver_should_stop = 0;
 
@@ -62,19 +49,11 @@ void fatal_error(const char *format, ...)
 
     winarc_wine_runtime_report_fatal(buffer);
 
-    /*
-     * Critical iOS rule: wineserver and UIKit share one process.
-     * A normal Wine exit(1) here would kill WinArc itself.
-     */
+    /* wineserver and UIKit share one Mach process. */
     pthread_exit(NULL);
 }
 
-/* Wine normally generates this during its full build. */
 const char wine_build[] = "wine-11.4-ios-winarc-reference";
-
-/* ------------------------------------------------------------------------- */
-/* iOS power-source compatibility stubs.                                      */
-/* ------------------------------------------------------------------------- */
 
 CFTypeRef IOPSCopyPowerSourcesInfo(void)
 {
@@ -94,15 +73,17 @@ CFDictionaryRef IOPSGetPowerSourceDescription(CFTypeRef blob, CFTypeRef source)
     return NULL;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Graphics backend boundary. Client execution is not enabled in this stage.  */
-/* ------------------------------------------------------------------------- */
-
-void *dxmt_winemetal_unix_call_funcs = NULL;
-
-/* ------------------------------------------------------------------------- */
-/* Minimal display-driver host hooks.                                         */
-/* ------------------------------------------------------------------------- */
+/*
+ * Important: DXMT defines this as
+ *
+ *     const void *dxmt_winemetal_unix_call_funcs[]
+ *
+ * Do not use the old `void *... = NULL` strong placeholder. A strong fake
+ * definition collides with — or masks — the real table. This weak one-element
+ * array is replaced by DXMT's strong definition at final link.
+ */
+__attribute__((weak))
+const void *dxmt_winemetal_unix_call_funcs[] = { NULL };
 
 int winios_pCreateWindow(void *hwnd)
 {

@@ -46,25 +46,60 @@ targets:
           $(inherited)
           -force_load
           $(SRCROOT)/../wine/build/winarc-wine-reference-link/libWinArcWineReference.a
+          -force_load
+          $(SRCROOT)/../wine/build/graphics/libWinArcDXMT.a
+          -lc++
+          -lsqlite3
           -framework CoreFoundation
           -framework CoreText
           -framework AudioToolbox
           -framework AVFoundation
           -framework IOKit
+          -framework UIKit
+          -framework Metal
+          -framework MetalFX
+          -framework QuartzCore
 
     postBuildScripts:
-      - name: Stage Wine NLS
+      - name: Stage Wine and Graphics Runtime
         script: |
           set -euo pipefail
 
-          NLS_SRC="${SRCROOT}/../wine/build/madeira-wine-reference-src/app/Madeira/nls"
+          REF_APP="${SRCROOT}/../wine/build/madeira-wine-reference-src/app/Madeira"
           APP_RES="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+
+          NLS_SRC="${REF_APP}/nls"
           NLS_DST="${APP_RES}/nls"
 
+          PE_SRC="${REF_APP}/aarch64-windows"
+          PE_DST="${APP_RES}/aarch64-windows"
+
           test -d "${NLS_SRC}"
+          test -d "${PE_SRC}"
+
+          # DXMT PE side. These are the exact modules paired with the iOS
+          # winemetal host side that is statically linked into WinArc.
+          test -s "${PE_SRC}/d3d11.dll"
+          test -s "${PE_SRC}/dxgi.dll"
+          test -s "${PE_SRC}/winemetal.dll"
+
           mkdir -p "${APP_RES}"
+
           rm -rf "${NLS_DST}"
           /usr/bin/ditto "${NLS_SRC}" "${NLS_DST}"
 
-          test -d "${NLS_DST}"
+          rm -rf "${PE_DST}"
+          /usr/bin/ditto "${PE_SRC}" "${PE_DST}"
+
+          test -s "${PE_DST}/d3d11.dll"
+          test -s "${PE_DST}/dxgi.dll"
+          test -s "${PE_DST}/winemetal.dll"
+
           echo "WINARC_WINE_NLS_BUNDLED=PASS"
+          echo "WINARC_DXMT_PE_RUNTIME_BUNDLED=PASS"
+
+          # D3DMetal is a first-class WinArc backend, but its Apple framework
+          # is intentionally NOT copied from the internet or from Madeira.
+          # If a compatible payload is later provided at this path, WinArc's
+          # GraphicsBackendBridge will validate it at runtime.
+          mkdir -p "${APP_RES}/Graphics/D3DMetal"
