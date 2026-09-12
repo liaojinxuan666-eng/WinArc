@@ -52,7 +52,11 @@ struct RuntimeStatusView: View {
         }
         .padding(18)
         .winArcGlass()
-        .onAppear(perform: probe)
+        .onAppear {
+            WinArcRuntimeLog.install()
+            WinArcRuntimeLog.mark("UI", "RuntimeStatusView appeared")
+            probe()
+        }
         .onReceive(refreshTimer) { _ in
             probe()
         }
@@ -414,7 +418,13 @@ struct RuntimeStatusView: View {
     }
 
     private func startWineServer() {
-        guard linked, let paths = runtimePaths() else { return }
+        WinArcRuntimeLog.install()
+        WinArcRuntimeLog.mark("UI", "start wineserver tapped")
+
+        guard linked, let paths = runtimePaths() else {
+            WinArcRuntimeLog.mark("UI", "start wineserver aborted before C bridge")
+            return
+        }
 
         startResult = paths.prefix.path.withCString { prefixCString in
             paths.nls.path.withCString { nlsCString in
@@ -431,12 +441,17 @@ struct RuntimeStatusView: View {
     }
 
     private func startWineDesktop() {
+        WinArcRuntimeLog.install()
+        WinArcRuntimeLog.mark("UI", "start Wine desktop tapped")
+
         guard linked,
               serverState == Int32(WINARC_WINESERVER_RUNNING),
               let paths = runtimePaths() else {
+            WinArcRuntimeLog.mark("UI", "start Wine desktop aborted before C bridge")
             return
         }
 
+        WinArcRuntimeLog.mark("UI", "calling winios_init")
         winios_init()
 
         startResult = paths.prefix.path.withCString { prefixCString in
@@ -450,6 +465,10 @@ struct RuntimeStatusView: View {
             }
         }
 
+        WinArcRuntimeLog.mark(
+            "UI",
+            "winarc_wine_runtime_start_desktop returned \(startResult)"
+        )
         probe()
     }
 }

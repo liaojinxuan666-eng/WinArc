@@ -1,4 +1,5 @@
 #include "WineRuntimeBridge.h"
+#include "RuntimeLogBridge.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -259,6 +260,7 @@ static void server_thread_cleanup(void *unused)
 
 static void *server_thread_main(void *unused)
 {
+    winarc_runtime_log_mark("WineServer", "server pthread entered");
     const struct winarc_wine_reference_boundary *value = boundary();
     char *argv[] = { (char *)"wineserver", (char *)"--foreground", NULL };
     int result;
@@ -281,7 +283,9 @@ static void *server_thread_main(void *unused)
 
     pthread_cleanup_push(server_thread_cleanup, NULL);
 
+    winarc_runtime_log_mark("WineServer", "entering wineserver_main");
     result = value->server_entry(2, argv);
+    winarc_runtime_log_mark("WineServer", "wineserver_main returned");
     __atomic_store_n(&g_server_exit_code, result, __ATOMIC_SEQ_CST);
 
     pthread_cleanup_pop(1);
@@ -291,6 +295,7 @@ static void *server_thread_main(void *unused)
 int winarc_wine_runtime_start_server(const char *prefix_path,
                                      const char *nls_path)
 {
+    winarc_runtime_log_mark("WineServer", "start_server requested");
     int current_state;
     int result;
 
@@ -361,6 +366,7 @@ int winarc_wine_runtime_start_server(const char *prefix_path,
                      WINARC_WINESERVER_STARTING,
                      __ATOMIC_SEQ_CST);
 
+    winarc_runtime_log_mark("WineServer", "creating wineserver pthread");
     result = pthread_create(&g_server_thread, NULL, server_thread_main, NULL);
     if (result != 0)
     {
@@ -395,6 +401,7 @@ static void client_thread_cleanup(void *unused)
 
 static void *client_thread_main(void *unused)
 {
+    winarc_runtime_log_mark("WineClient", "client pthread entered");
     const struct winarc_wine_reference_boundary *value = boundary();
 
 #if defined(__APPLE__)
@@ -454,6 +461,7 @@ static void *client_thread_main(void *unused)
 
     /* Keep desktop bring-up quiet enough to see genuine bootstrap failures. */
     setenv("WINEDEBUG", "err+all,err-virtual", 1);
+    winarc_runtime_log_mark("WineClient", "Wine client environment prepared");
 
     /*
      * Desktop bring-up does not initialize DXMT or D3DMetal. The shell is a
@@ -474,7 +482,9 @@ static void *client_thread_main(void *unused)
 
     if (setjmp(wine_ios_exit_jmpbuf) == 0)
     {
+        winarc_runtime_log_mark("WineClient", "ENTER __wine_main");
         value->client_entry(3, argv);
+        winarc_runtime_log_mark("WineClient", "RETURN __wine_main");
 
         __atomic_store_n(&g_client_exit_code, 0, __ATOMIC_SEQ_CST);
         __atomic_store_n(&g_client_state,
@@ -484,6 +494,7 @@ static void *client_thread_main(void *unused)
     else
     {
         int exit_code = wine_ios_exit_code;
+        winarc_runtime_log_mark("WineClient", "wine_ios_exit longjmp received");
 
         __atomic_store_n(&g_client_exit_code,
                          exit_code,
@@ -517,6 +528,7 @@ static void *client_thread_main(void *unused)
 int winarc_wine_runtime_start_desktop(const char *prefix_path,
                                       const char *bundle_path)
 {
+    winarc_runtime_log_mark("WineClient", "start_desktop requested");
     int pair[2];
     int state;
     int result;
@@ -554,8 +566,10 @@ int winarc_wine_runtime_start_desktop(const char *prefix_path,
         return -5;
     }
 
+    winarc_runtime_log_mark("WineClient", "preparing PE farm");
     if (prepare_pe_farm(prefix_path, bundle_path) != 0)
         return -3;
+    winarc_runtime_log_mark("WineClient", "PE farm ready");
 
     snprintf(g_client_context.prefix,
              sizeof(g_client_context.prefix), "%s", prefix_path);
@@ -576,6 +590,7 @@ int winarc_wine_runtime_start_desktop(const char *prefix_path,
     snprintf(g_client_context.bundle,
              sizeof(g_client_context.bundle), "%s", bundle_path);
 
+    winarc_runtime_log_mark("WineClient", "creating wineserver socketpair");
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0)
     {
         char buffer[256];
@@ -601,7 +616,9 @@ int winarc_wine_runtime_start_desktop(const char *prefix_path,
      *   3. inject the server fd into the in-process wineserver
      *   4. enter __wine_main on a separate pthread
      */
+    winarc_runtime_log_mark("WineClient", "injecting server side fd");
     wineserver_inject_client_fd(pair[0]);
+    winarc_runtime_log_mark("WineClient", "server side fd injected");
 
     set_last_error("");
     __atomic_store_n(&g_client_exit_code, -9999, __ATOMIC_SEQ_CST);
@@ -609,6 +626,7 @@ int winarc_wine_runtime_start_desktop(const char *prefix_path,
                      WINARC_WINECLIENT_STARTING,
                      __ATOMIC_SEQ_CST);
 
+    winarc_runtime_log_mark("WineClient", "creating Wine client pthread");
     result = pthread_create(&g_client_thread, NULL, client_thread_main, NULL);
     if (result != 0)
     {
