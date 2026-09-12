@@ -195,7 +195,6 @@ enum WinArcRuntimeLog {
         try? handle.seek(toOffset: start)
 
         guard let data = try? handle.readToEnd(),
-              let data,
               !data.isEmpty else {
             return "日志文件为空。"
         }
