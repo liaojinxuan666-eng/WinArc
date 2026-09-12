@@ -42,9 +42,7 @@ struct HomeView: View {
             ZStack(alignment: .topLeading) {
                 MadeiraLegacyContentView()
                     .onAppear {
-                        DispatchQueue.main.asyncAfter(
-                            deadline: .now() + 0.35
-                        ) {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                             NotificationCenter.default.post(
                                 name: .winArcLaunchDesktop,
                                 object: nil
@@ -74,16 +72,8 @@ struct HomeView: View {
         ZStack(alignment: .bottomLeading) {
             LinearGradient(
                 colors: [
-                    Color(
-                        red: 0.08,
-                        green: 0.18,
-                        blue: 0.36
-                    ),
-                    Color(
-                        red: 0.08,
-                        green: 0.08,
-                        blue: 0.13
-                    )
+                    Color(red: 0.08, green: 0.18, blue: 0.36),
+                    Color(red: 0.08, green: 0.08, blue: 0.13)
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
@@ -91,13 +81,7 @@ struct HomeView: View {
 
             VStack(alignment: .leading, spacing: 13) {
                 Text("Windows games.\nYour way.")
-                    .font(
-                        .system(
-                            size: 40,
-                            weight: .bold,
-                            design: .rounded
-                        )
-                    )
+                    .font(.system(size: 40, weight: .bold, design: .rounded))
 
                 Text(
                     store.containers.isEmpty
@@ -107,19 +91,11 @@ struct HomeView: View {
                 .foregroundStyle(.white.opacity(0.66))
 
                 Button(
-                    action:
-                        store.containers.isEmpty
-                        ? onCreateContainer
-                        : onImportGame
+                    action: store.containers.isEmpty ? onCreateContainer : onImportGame
                 ) {
                     Label(
-                        store.containers.isEmpty
-                        ? "创建容器"
-                        : "导入游戏",
-                        systemImage:
-                            store.containers.isEmpty
-                            ? "plus"
-                            : "square.and.arrow.down"
+                        store.containers.isEmpty ? "创建容器" : "导入游戏",
+                        systemImage: store.containers.isEmpty ? "plus" : "square.and.arrow.down"
                     )
                     .fontWeight(.semibold)
                     .padding(.horizontal, 18)
@@ -133,12 +109,7 @@ struct HomeView: View {
             .padding(28)
         }
         .frame(height: 285)
-        .clipShape(
-            RoundedRectangle(
-                cornerRadius: 28,
-                style: .continuous
-            )
-        )
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
     }
 
     private var jitCard: some View {
@@ -167,26 +138,11 @@ struct HomeView: View {
                 .foregroundStyle(WinArcTheme.secondary)
 
             HStack(spacing: 18) {
-                jitMetric(
-                    "Debugger",
-                    jit.debuggerAttached ? "OK" : "—"
-                )
-                jitMetric(
-                    "Dual Map",
-                    jit.dualMappingAvailable ? "OK" : "—"
-                )
-                jitMetric(
-                    "Execute",
-                    jit.executionValidated ? "OK" : "—"
-                )
-                jitMetric(
-                    "Pool",
-                    "\(jit.effectivePoolMB)MB"
-                )
-                jitMetric(
-                    "Memory",
-                    "\(jit.physicalFootprintMB)MB"
-                )
+                jitMetric("Debugger", jit.debuggerAttached ? "OK" : "—")
+                jitMetric("Dual Map", jit.dualMappingAvailable ? "OK" : "—")
+                jitMetric("Execute", jit.executionValidated ? "OK" : "未测")
+                jitMetric("Pool", "\(jit.effectivePoolMB)MB")
+                jitMetric("Memory", "\(jit.physicalFootprintMB)MB")
 
                 Spacer()
 
@@ -217,11 +173,8 @@ struct HomeView: View {
     private var desktopCard: some View {
         HStack(spacing: 16) {
             ZStack {
-                RoundedRectangle(
-                    cornerRadius: 14,
-                    style: .continuous
-                )
-                .fill(Color.blue.opacity(0.16))
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color.blue.opacity(0.16))
 
                 Image(systemName: "desktopcomputer")
                     .font(.system(size: 25, weight: .semibold))
@@ -237,20 +190,15 @@ struct HomeView: View {
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(WinArcTheme.secondary)
 
-                Text(
-                    "启动前先执行完整 JIT Self Test；" +
-                    "通过后才建立 Runtime Pool。"
-                )
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.white.opacity(0.42))
+                Text("启动只做安全 Preflight；高级 Self Test 不再是启动门槛。")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.42))
             }
 
             Spacer()
 
             Button(
-                jit.isRunningFullTest
-                ? "JIT 检测中…"
-                : "启动桌面"
+                jit.isPreparingRuntime ? "JIT 预检中…" : "启动桌面"
             ) {
                 jit.validateForRuntimeLaunch { passed in
                     if passed {
@@ -261,7 +209,11 @@ struct HomeView: View {
                 }
             }
             .buttonStyle(.borderedProminent)
-            .disabled(jit.isRunningFullTest)
+            .disabled(
+                jit.isPreparingRuntime ||
+                jit.isRunningFullTest ||
+                jit.isRunningQuickCheck
+            )
         }
         .padding(18)
         .winArcGlass()
@@ -300,10 +252,7 @@ struct HomeView: View {
         }
     }
 
-    private func jitMetric(
-        _ title: String,
-        _ value: String
-    ) -> some View {
+    private func jitMetric(_ title: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title)
                 .font(.caption2)

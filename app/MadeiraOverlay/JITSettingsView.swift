@@ -3,6 +3,7 @@ import SwiftUI
 struct JITSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var jit = WinArcJITManager.shared
+    @State private var showSelfTestWarning = false
 
     var body: some View {
         NavigationStack {
@@ -25,6 +26,20 @@ struct JITSettingsView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .alert(
+            "运行高级 Self Test？",
+            isPresented: $showSelfTestWarning
+        ) {
+            Button("取消", role: .cancel) {}
+            Button("继续运行", role: .destructive) {
+                jit.runFullSelfTest()
+            }
+        } message: {
+            Text(
+                "该测试会实际执行生成的 ARM64 代码并进入 Debugger BRK 路径。" +
+                "它不是正常启动所必需的；当前用于定位 JIT 问题，失败时可能导致 App 退出。"
+            )
+        }
     }
 
     private var statusCard: some View {
@@ -55,13 +70,24 @@ struct JITSettingsView: View {
                 .buttonStyle(.bordered)
 
                 Button(
-                    jit.isRunningFullTest ? "检测中…" : "完整 Self Test"
+                    jit.isRunningFullTest ? "检测中…" : "高级 Self Test"
                 ) {
-                    jit.runFullSelfTest()
+                    showSelfTestWarning = true
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(jit.isRunningFullTest)
+                .buttonStyle(.bordered)
+                .disabled(
+                    jit.isRunningFullTest ||
+                    jit.isRunningQuickCheck ||
+                    jit.isPreparingRuntime
+                )
             }
+
+            Label(
+                "正常启动不再执行 Self Test；Runtime Pool 建立结果才是主要验证。",
+                systemImage: "info.circle"
+            )
+            .font(.footnote)
+            .foregroundStyle(WinArcTheme.secondary)
         }
         .padding(20)
         .winArcGlass()
@@ -124,8 +150,7 @@ struct JITSettingsView: View {
                         value: Binding(
                             get: { Double(jit.customPoolMB) },
                             set: {
-                                let stepped =
-                                    Int(($0 / 64).rounded()) * 64
+                                let stepped = Int(($0 / 64).rounded()) * 64
                                 jit.customPoolMB = stepped
                             }
                         ),
@@ -175,7 +200,7 @@ struct JITSettingsView: View {
             )
             diagnosticRow(
                 "Execution",
-                jit.executionValidated ? "通过" : "未验证"
+                jit.executionValidated ? "通过" : "未测试"
             )
             diagnosticRow(
                 "Physical Footprint",
@@ -216,10 +241,7 @@ struct JITSettingsView: View {
         .winArcGlass()
     }
 
-    private func diagnosticRow(
-        _ name: String,
-        _ value: String
-    ) -> some View {
+    private func diagnosticRow(_ name: String, _ value: String) -> some View {
         HStack {
             Text(name)
                 .foregroundStyle(WinArcTheme.secondary)
