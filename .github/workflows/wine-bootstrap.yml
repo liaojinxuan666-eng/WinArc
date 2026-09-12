@@ -3,10 +3,16 @@ name: Wine bootstrap gate
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
-      - "wine/bootstrap-wine.sh"
+      - "wine/**"
+      - "tests/**"
+      - ".github/workflows/wine-bootstrap.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "wine/**"
+      - "tests/**"
       - ".github/workflows/wine-bootstrap.yml"
 
 jobs:
@@ -17,6 +23,9 @@ jobs:
     steps:
       - name: Checkout WinArc
         uses: actions/checkout@v4
+
+      - name: Test archive validation
+        run: python3 -m unittest discover -s tests -p "test_*.py"
 
       - name: Install Wine build tools
         shell: bash
@@ -38,22 +47,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          grep -F "JUICE_IOS_SERVER_PATCHES=PASS" wine-bootstrap.log
-          grep -F "WINE_HOST_HEADERS=PASS" wine-bootstrap.log
-          grep -F "WINE_HOST_TOOLS=PASS" wine-bootstrap.log
-
-          grep -F "WINE_IOS_SERVER_SOURCE_COUNT=44" wine-bootstrap.log
-          grep -F "WINE_IOS_SERVER_OBJECT_COMPILE=PASS" wine-bootstrap.log
-          grep -F "WINE_SERVER_THREAD_BRIDGE_OBJECT=PASS" wine-bootstrap.log
-          grep -F "WINE_SERVER_RENAMED_MAIN=PASS" wine-bootstrap.log
-          grep -F "WINE_IOS_SERVER_STATIC_ARCHIVE=PASS" wine-bootstrap.log
-
-          grep -F "WINE_FULL_IOS_CONFIGURE=SKIPPED" wine-bootstrap.log
-          grep -F "MADEIRA_ARCHITECTURE_ADAPTED=STATIC_SERVER_AND_THREAD_BOUNDARY" wine-bootstrap.log
-
-          grep -F "WINARC_WINE_BOOTSTRAP=PASS" wine-bootstrap.log
-          grep -F "NEXT_STAGE=IOS_SERVER_RUNTIME_PATCH_SET" wine-bootstrap.log
+          grep -Fx "WINARC_WINE_BOOTSTRAP_REVISION=9" wine-bootstrap.log
+          grep -Fx "MADEIRA_WINE_NATIVE_ARCHIVES=PASS" wine-bootstrap.log
+          grep -Fx "WINARC_REFERENCE_ARCHIVE_AUDIT=PASS" wine-bootstrap.log
+          grep -Fx "WINARC_SERVER_CLIENT_STATE_ISOLATION=PASS" wine-bootstrap.log
+          grep -Fx "WINARC_WINE_RELOCATABLE_LINK=PASS" wine-bootstrap.log
+          grep -Fx "WINARC_WINE_EXECUTABLE_LINK=NOT_RUN" wine-bootstrap.log
+          grep -Fx "WINARC_WINE_RUNTIME_EXECUTION=NOT_RUN" wine-bootstrap.log
+          grep -Fx "WINARC_WINE_BOOTSTRAP=PASS" wine-bootstrap.log
+          test -s wine/build/winarc-wine-reference-link/libWinArcWineReference.a
 
       - name: Upload Wine build
         if: always()
@@ -64,5 +66,4 @@ jobs:
             wine-bootstrap.log
             wine/BASELINE
             wine/build/logs/
-            wine/build/libWinArcWineServer.a
           if-no-files-found: warn
