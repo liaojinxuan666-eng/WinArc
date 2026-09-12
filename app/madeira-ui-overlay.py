@@ -66,15 +66,34 @@ jit_source = jit_helper_path.read_text(encoding="utf-8")
 
 jit_anchor = "        // Ask debugger to allocate RX pages (x0=0 triggers _M allocation).\n"
 
-jit_block = '''        // WinArc JIT Core v0.2: local dual-map production pool.
+jit_block = '''        // WinArc JIT Core v0.3: direct local dual-map pool.
+        //
+        // Hardware result from v0.2:
+        //   - 256MB RW/RX dual mapping succeeds
+        //   - the very first debugger prepare of an EXISTING RX mapping
+        //     kills the process, even when reduced to a 16MB chunk
+        //
+        // Therefore the Local Dual Map strategy must not call
+        // jit26_prepare_region() at all. CS_DEBUGGED is already SET and
+        // jit_test_mapping() has verified a coherent RX mapping with execute
+        // protection. This experiment tests whether FEX can execute directly
+        // from that locally-created RX alias.
         if ProcessInfo.processInfo.environment["WINARC_LOCAL_JIT_POOL"] == "1" {
             LogStore.shared.log(
-                "WinArc JIT pool: local dual-map path enabled"
+                "WinArc JIT pool: local dual-map DIRECT path enabled"
             )
+
+            guard jit_check_debugged() else {
+                LogStore.shared.log(
+                    "WinArc local direct pool: CS_DEBUGGED not set",
+                    level: .error
+                )
+                return nil
+            }
 
             guard let region = jit_region_create(poolSize) else {
                 LogStore.shared.log(
-                    "WinArc local JIT pool: jit_region_create failed",
+                    "WinArc local direct pool: jit_region_create failed",
                     level: .error
                 )
                 return nil
@@ -83,7 +102,7 @@ jit_block = '''        // WinArc JIT Core v0.2: local dual-map production pool.
             guard let rxPtr = jit_region_rx_ptr(region),
                   let rwPtr = jit_region_rw_ptr(region) else {
                 LogStore.shared.log(
-                    "WinArc local JIT pool: missing RW/RX mapping",
+                    "WinArc local direct pool: missing RW/RX mapping",
                     level: .error
                 )
                 jit_region_destroy(region)
@@ -91,6 +110,7 @@ jit_block = '''        // WinArc JIT Core v0.2: local dual-map production pool.
             }
 
             let localRX = Int(bitPattern: rxPtr)
+            let localRW = Int(bitPattern: rwPtr)
             let localGoodLow = 0x119000000
             let localGuestLo = 0x7000000000
             let localGuestHi = 0x8000000000
@@ -103,7 +123,9 @@ jit_block = '''        // WinArc JIT Core v0.2: local dual-map production pool.
                 LogStore.shared.log(
                     String(
                         format:
-                            "WinArc local JIT pool BAD placement 0x%lx",
+                            "WinArc local direct pool BAD placement " +
+                            "RW=0x%lx RX=0x%lx",
+                        localRW,
                         localRX
                     ),
                     level: .error
@@ -115,62 +137,17 @@ jit_block = '''        // WinArc JIT Core v0.2: local dual-map production pool.
             LogStore.shared.log(
                 String(
                     format:
-                        "WinArc local RX pool at 0x%lx",
-                    localRX
+                        "WinArc local direct pool mapped " +
+                        "RW=0x%lx RX=0x%lx size=%dMB",
+                    localRW,
+                    localRX,
+                    poolSize / 1024 / 1024
                 )
             )
 
-            let prepareChunkSize = 16 * 1024 * 1024
-            var prepareOffset = 0
-            var prepareIndex = 0
-
             LogStore.shared.log(
-                "WinArc local pool: chunked debugger prepare BEGIN " +
-                "(chunk=16MB total=\\(poolSize / 1024 / 1024)MB)"
-            )
-
-            while prepareOffset < poolSize {
-                let remaining = poolSize - prepareOffset
-                let thisSize = min(prepareChunkSize, remaining)
-                let thisPtr = rxPtr.advanced(by: prepareOffset)
-
-                LogStore.shared.log(
-                    String(
-                        format:
-                            "WinArc local prepare chunk %d BEGIN " +
-                            "addr=0x%lx size=%dMB",
-                        prepareIndex,
-                        Int(bitPattern: thisPtr),
-                        thisSize / 1024 / 1024
-                    )
-                )
-
-                let prepared = jit26_prepare_region(
-                    thisPtr,
-                    thisSize
-                )
-
-                guard prepared != nil else {
-                    LogStore.shared.log(
-                        "WinArc local prepare chunk \\(prepareIndex) " +
-                        "returned NULL",
-                        level: .error
-                    )
-                    return nil
-                }
-
-                LogStore.shared.log(
-                    "WinArc local prepare chunk \\(prepareIndex) PASS",
-                    level: .success
-                )
-
-                prepareOffset += thisSize
-                prepareIndex += 1
-            }
-
-            LogStore.shared.log(
-                "WinArc local pool: ALL debugger prepare chunks PASS",
-                level: .success
+                "WinArc local direct pool: SKIPPING debugger prepare " +
+                "(existing-RX prepare crashes on this device)"
             )
 
             NotificationCenter.default.post(
@@ -178,6 +155,12 @@ jit_block = '''        // WinArc JIT Core v0.2: local dual-map production pool.
                 object: nil
             )
 
+            LogStore.shared.log(
+                "WinArc local direct pool: READY -> returning to Madeira/FEX",
+                level: .success
+            )
+
+            // Process-lifetime retention. The JITRegion owns both aliases.
             return (
                 rx: rxPtr,
                 rw: rwPtr,
@@ -197,7 +180,7 @@ else:
     )
     if block_start < 0:
         block_start = jit_source.find(
-            '        // WinArc JIT Core v0.2: local dual-map production pool.'
+            '        // WinArc JIT Core v0.3: direct local dual-map pool.'
         )
 
     stock_pos = jit_source.find(jit_anchor)
@@ -381,12 +364,12 @@ assert re.search(
 assert "winarc_graphics_backend_status_text" not in generated
 assert ".winArcLaunchDesktop" in generated
 assert ".winArcJITPoolReady" in generated
-assert "WinArc JIT Core v0.2" in jit_generated
-assert "prepare chunk" in jit_generated
+assert "WinArc JIT Core v0.3" in jit_generated
+assert "SKIPPING debugger prepare" in jit_generated
 
 print("WINARC_MADEIRA_UI_OVERLAY=PASS")
 print("WINARC_JIT_CORE_V0=PASS")
-print("WINARC_JIT_CHUNKED_PREPARE=PASS")
+print("WINARC_JIT_DIRECT_LOCAL_POOL=PASS")
 print("WINARC_JIT_HOME_QUICK_CHECK=PASS")
 print("WINARC_JIT_SETTINGS=PASS")
 print("WINARC_JIT_RECOVERY=PASS")
