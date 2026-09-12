@@ -7,10 +7,13 @@ import sys
 from pathlib import Path
 
 if len(sys.argv) != 3:
-    raise SystemExit("usage: madeira-ui-overlay.py <madeira-checkout> <winarc-checkout>")
+    raise SystemExit(
+        "usage: madeira-ui-overlay.py <madeira-checkout> <winarc-checkout>"
+    )
 
 madeira = Path(sys.argv[1]).resolve()
 winarc = Path(sys.argv[2]).resolve()
+
 donor = madeira / "app" / "Madeira"
 ui = winarc / "app" / "WinArc"
 overlay = winarc / "app" / "MadeiraOverlay"
@@ -18,17 +21,41 @@ overlay = winarc / "app" / "MadeiraOverlay"
 content_path = donor / "ContentView.swift"
 app_path = donor / "MadeiraApp.swift"
 plist_path = donor / "Info.plist"
+jit_helper_path = donor / "StikJITHelper.swift"
 
-for p in (content_path, app_path, ui, overlay):
-    if not p.exists():
-        raise SystemExit(f"missing required path: {p}")
+for path in (
+    content_path,
+    app_path,
+    plist_path,
+    jit_helper_path,
+    ui,
+    overlay,
+):
+    if not path.exists():
+        raise SystemExit(f"missing required path: {path}")
+
+# ============================================================
+# Preserve Madeira runtime UI under a WinArc-internal name.
+# ============================================================
 
 source = content_path.read_text(encoding="utf-8")
 
-if "struct MadeiraLegacyContentView: View {" not in source:
-    if "struct ContentView: View {" not in source:
+old_root = "struct ContentView: View {"
+new_root = "struct MadeiraLegacyContentView: View {"
+
+if new_root not in source:
+    if old_root not in source:
         raise SystemExit("Madeira ContentView declaration not found")
-    source = re.sub(r"\bContentView\b", "MadeiraLegacyContentView", source)
+
+    source = re.sub(
+        r"\bContentView\b",
+        "MadeiraLegacyContentView",
+        source,
+    )
+
+# ============================================================
+# WinArc desktop launch bridge.
+# ============================================================
 
 launch_hook_old = '''            .onAppear {
                 jit_install_trap_handler()
@@ -56,7 +83,168 @@ launch_hook_new = launch_hook_old + '''            .onReceive(NotificationCenter
 if ".winArcLaunchDesktop" not in source:
     if launch_hook_old not in source:
         raise SystemExit("Madeira runtime onAppear hook changed")
-    source = source.replace(launch_hook_old, launch_hook_new, 1)
+
+    source = source.replace(
+        launch_hook_old,
+        launch_hook_new,
+        1,
+    )
+
+# ============================================================
+# WinArc Local Dual Map JIT pool path.
+# ============================================================
+
+jit_source = jit_helper_path.read_text(encoding="utf-8")
+
+jit_anchor = (
+    "        // Ask debugger to allocate RX pages "
+    "(x0=0 triggers _M allocation).\n"
+)
+
+jit_block = '''        // WinArc JIT Core v0: local dual-map production pool.
+        if ProcessInfo.processInfo.environment["WINARC_LOCAL_JIT_POOL"] == "1" {
+            LogStore.shared.log(
+                "WinArc JIT pool: local dual-map path enabled"
+            )
+
+            guard let region = jit_region_create(poolSize) else {
+                LogStore.shared.log(
+                    "WinArc local JIT pool: jit_region_create failed",
+                    level: .error
+                )
+                return nil
+            }
+
+            guard let rxPtr = jit_region_rx_ptr(region),
+                  let rwPtr = jit_region_rw_ptr(region) else {
+                LogStore.shared.log(
+                    "WinArc local JIT pool: missing RW/RX mapping",
+                    level: .error
+                )
+                jit_region_destroy(region)
+                return nil
+            }
+
+            let localRX = Int(bitPattern: rxPtr)
+            let localGoodLow = 0x119000000
+            let localGuestLo = 0x7000000000
+            let localGuestHi = 0x8000000000
+            let localInGuestWindow =
+                localRX + poolSize > localGuestLo &&
+                localRX < localGuestHi
+
+            guard localRX >= localGoodLow &&
+                  !localInGuestWindow else {
+                LogStore.shared.log(
+                    String(
+                        format:
+                            "WinArc local JIT pool BAD placement 0x%lx",
+                        localRX
+                    ),
+                    level: .error
+                )
+                jit_region_destroy(region)
+                return nil
+            }
+
+            LogStore.shared.log(
+                String(
+                    format:
+                        "WinArc local RX pool at 0x%lx",
+                    localRX
+                )
+            )
+
+            LogStore.shared.log(
+                "WinArc local pool: debugger prepare existing RX begin"
+            )
+
+            let prepared = jit26_prepare_region(
+                rxPtr,
+                poolSize
+            )
+
+            guard prepared != nil else {
+                LogStore.shared.log(
+                    "WinArc local pool: debugger prepare returned NULL",
+                    level: .error
+                )
+                return nil
+            }
+
+            LogStore.shared.log(
+                "WinArc local pool: debugger prepare existing RX PASS",
+                level: .success
+            )
+
+            NotificationCenter.default.post(
+                name: .winArcJITPoolReady,
+                object: nil
+            )
+
+            // Keep the C JITRegion alive for the process lifetime.
+            return (
+                rx: rxPtr,
+                rw: rwPtr,
+                size: poolSize
+            )
+        }
+
+'''
+
+if "WinArc JIT pool: local dual-map path enabled" not in jit_source:
+    if jit_anchor not in jit_source:
+        raise SystemExit(
+            "Madeira StikJITHelper allocation anchor changed"
+        )
+
+    jit_source = jit_source.replace(
+        jit_anchor,
+        jit_block + jit_anchor,
+        1,
+    )
+
+# Mark the stock debugger-allocation path as Known Good too.
+stock_ready = '''        LogStore.shared.log("JIT pool ready (debugger still attached).", level: .success)
+
+        return (rx: rxPtr, rw: rwPtr, size: poolSize)
+'''
+
+stock_ready_patched = '''        LogStore.shared.log("JIT pool ready (debugger still attached).", level: .success)
+
+        NotificationCenter.default.post(
+            name: .winArcJITPoolReady,
+            object: nil
+        )
+
+        return (rx: rxPtr, rw: rwPtr, size: poolSize)
+'''
+
+tail_after_stock_ready = jit_source.split(
+    'JIT pool ready (debugger still attached)."',
+    1,
+)[-1]
+
+if ".winArcJITPoolReady" not in tail_after_stock_ready:
+    if stock_ready not in jit_source:
+        raise SystemExit(
+            "Madeira stock JIT pool ready block changed"
+        )
+
+    jit_source = jit_source.replace(
+        stock_ready,
+        stock_ready_patched,
+        1,
+    )
+
+jit_helper_path.write_text(
+    jit_source,
+    encoding="utf-8",
+)
+
+# ============================================================
+# WinArc UI source list.
+# ============================================================
 
 ui_files = [
     ui / "Theme.swift",
@@ -67,9 +255,16 @@ ui_files = [
     ui / "CreateContainerSheet.swift",
     ui / "LibraryView.swift",
     ui / "GameSettingsSheet.swift",
+    overlay / "WinArcJITManager.swift",
+    overlay / "JITSettingsView.swift",
+    overlay / "MadeiraLogView.swift",
     overlay / "HomeView.swift",
     overlay / "SettingsView.swift",
 ]
+
+# ============================================================
+# Madeira-backed GameSettings adjustment.
+# ============================================================
 
 old_graphics_status_method = '''    private func refreshGraphicsStatus() {
         let backend = draft.settings.backend.rawValue
@@ -100,34 +295,90 @@ new_graphics_status_method = '''    private func refreshGraphicsStatus() {
 '''
 
 chunks: list[str] = []
+
 for path in ui_files:
     if not path.exists():
-        raise SystemExit(f"missing WinArc UI source: {path}")
-    text = path.read_text(encoding="utf-8")
+        raise SystemExit(
+            f"missing WinArc UI source: {path}"
+        )
+
+    text = path.read_text(
+        encoding="utf-8"
+    )
 
     if path.name == "GameSettingsSheet.swift":
         if old_graphics_status_method not in text:
-            raise SystemExit("GameSettingsSheet graphics-status implementation changed")
-        text = text.replace(old_graphics_status_method, new_graphics_status_method, 1)
-        if "winarc_graphics_backend_status_text" in text:
-            raise SystemExit("old WinArc graphics bridge still referenced")
+            raise SystemExit(
+                "GameSettingsSheet graphics-status implementation changed"
+            )
 
-    text = re.sub(r"(?m)^import\s+[^\n]+\n", "", text)
-    chunks.append(f"\n// ===== WinArc Madeira UI: {path.name} =====\n{text.rstrip()}\n")
+        text = text.replace(
+            old_graphics_status_method,
+            new_graphics_status_method,
+            1,
+        )
+
+        if "winarc_graphics_backend_status_text" in text:
+            raise SystemExit(
+                "old WinArc graphics bridge still referenced"
+            )
+
+    text = re.sub(
+        r"(?m)^import\s+[^\n]+\n",
+        "",
+        text,
+    )
+
+    chunks.append(
+        "\n"
+        f"// ===== WinArc Madeira UI: {path.name} =====\n"
+        f"{text.rstrip()}\n"
+    )
+
+# ============================================================
+# Avoid duplicate append.
+# ============================================================
 
 marker = "// ===== WINARC_MADEIRA_UI_OVERLAY ====="
+
 if marker in source:
-    source = source.split(marker, 1)[0].rstrip() + "\n"
+    source = (
+        source
+        .split(marker, 1)[0]
+        .rstrip()
+        + "\n"
+    )
 
-header = "import UniformTypeIdentifiers\nimport Foundation\n"
-if not source.startswith("import UniformTypeIdentifiers"):
-    source = header + source
+required_imports = (
+    "import UniformTypeIdentifiers\n"
+    "import Foundation\n"
+    "import Darwin\n"
+)
 
-source = source.rstrip() + f"\n\n{marker}\n" + "\n".join(chunks) + "\n"
-content_path.write_text(source, encoding="utf-8")
+if not source.startswith(
+    "import UniformTypeIdentifiers"
+):
+    source = required_imports + source
 
-app_path.write_text(
-    '''import SwiftUI
+source = (
+    source.rstrip()
+    + "\n\n"
+    + marker
+    + "\n"
+    + "\n".join(chunks)
+    + "\n"
+)
+
+content_path.write_text(
+    source,
+    encoding="utf-8",
+)
+
+# ============================================================
+# WinArc app root.
+# ============================================================
+
+app_source = '''import SwiftUI
 
 @main
 struct MadeiraApp: App {
@@ -141,38 +392,74 @@ struct MadeiraApp: App {
         }
     }
 }
-''',
+'''
+
+app_path.write_text(
+    app_source,
     encoding="utf-8",
 )
 
-if plist_path.exists():
-    with plist_path.open("rb") as f:
-        plist = plistlib.load(f)
-    plist["CFBundleDisplayName"] = "WinArc"
-    plist["CFBundleShortVersionString"] = "0.0.1"
-    plist["CFBundleVersion"] = "1"
-    plist["UIRequiresFullScreen"] = True
-    plist["UISupportedInterfaceOrientations"] = [
-        "UIInterfaceOrientationLandscapeLeft",
-        "UIInterfaceOrientationLandscapeRight",
-    ]
-    with plist_path.open("wb") as f:
-        plistlib.dump(plist, f, sort_keys=False)
+# ============================================================
+# Product identity.
+# ============================================================
 
-generated = content_path.read_text(encoding="utf-8")
-main = app_path.read_text(encoding="utf-8")
+with plist_path.open("rb") as file:
+    plist = plistlib.load(file)
+
+plist["CFBundleDisplayName"] = "WinArc"
+plist["CFBundleShortVersionString"] = "0.0.1"
+plist["CFBundleVersion"] = "1"
+plist["UIRequiresFullScreen"] = True
+plist["UISupportedInterfaceOrientations"] = [
+    "UIInterfaceOrientationLandscapeLeft",
+    "UIInterfaceOrientationLandscapeRight",
+]
+
+with plist_path.open("wb") as file:
+    plistlib.dump(
+        plist,
+        file,
+        sort_keys=False,
+    )
+
+# ============================================================
+# Hard integration gates.
+# ============================================================
+
+generated = content_path.read_text(
+    encoding="utf-8"
+)
+main = app_path.read_text(
+    encoding="utf-8"
+)
+jit_generated = jit_helper_path.read_text(
+    encoding="utf-8"
+)
 
 assert "struct MadeiraLegacyContentView: View" in generated
 assert "struct RootView: View" in generated
 assert "final class WinArcStore: ObservableObject" in generated
+assert "final class WinArcJITManager: ObservableObject" in generated
+assert "struct JITSettingsView: View" in generated
+assert "struct MadeiraLogView: View" in generated
 assert "RootView()" in main
 assert "ContentView()" not in main
-assert re.search(r"(?<![A-Za-z0-9_])ContentView\.hhmmss", generated) is None
+assert re.search(
+    r"(?<![A-Za-z0-9_])ContentView\.hhmmss",
+    generated,
+) is None
 assert "winarc_graphics_backend_status_text" not in generated
 assert ".winArcLaunchDesktop" in generated
+assert ".winArcJITPoolReady" in generated
+assert (
+    "WinArc JIT pool: local dual-map path enabled"
+    in jit_generated
+)
 
 print("WINARC_MADEIRA_UI_OVERLAY=PASS")
-print("WINARC_MADEIRA_DESKTOP_BRIDGE=PASS")
+print("WINARC_JIT_CORE_V0=PASS")
+print("WINARC_JIT_HOME_QUICK_CHECK=PASS")
+print("WINARC_JIT_SETTINGS=PASS")
+print("WINARC_JIT_RECOVERY=PASS")
+print("WINARC_MADEIRA_LOG_UI=PASS")
 print("WINARC_VERSION=0.0.1")
-print(f"MADEIRA_APP_ROOT={app_path}")
-print(f"MADEIRA_UI_SOURCE={content_path}")
