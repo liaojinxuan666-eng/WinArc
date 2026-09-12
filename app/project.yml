@@ -2,19 +2,24 @@ name: WinArc
 options:
   bundleIdPrefix: com.winarc
   deploymentTarget:
-    iOS: "16.0"
+    iOS: "17.0"
+
 settings:
   base:
     SWIFT_VERSION: 5.0
     TARGETED_DEVICE_FAMILY: "1,2"
     DEVELOPMENT_TEAM: ""
     CODE_SIGN_STYLE: Automatic
+
 targets:
   WinArc:
     type: application
     platform: iOS
+
     sources:
       - path: WinArc
+      - path: WinArcRuntime
+
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.winarc.app
@@ -22,10 +27,28 @@ targets:
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
         INFOPLIST_KEY_UIRequiresFullScreen: YES
+
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+
         GENERATE_INFOPLIST_FILE: YES
+        SWIFT_OBJC_BRIDGING_HEADER: WinArc/WinArc-Bridging-Header.h
+
+        # Runtime bring-up: deliberately keep symbols visible while we prove
+        # that Wine is inside the same Mach-O as the WinArc shell.
+        DEAD_CODE_STRIPPING: NO
+        STRIP_INSTALLED_PRODUCT: NO
+
+        OTHER_LDFLAGS: >-
+          $(inherited)
+          -force_load
+          $(SRCROOT)/../wine/build/winarc-wine-reference-link/libWinArcWineReference.a
+          -framework CoreFoundation
+          -framework CoreText
+          -framework AudioToolbox
+          -framework AVFoundation
+          -framework IOKit

@@ -46,6 +46,8 @@ struct HomeView: View {
                 .frame(height: 285)
                 .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
 
+                RuntimeStatusView()
+
                 if store.games.isEmpty {
                     HStack(spacing: 16) {
                         Image(systemName: "gamecontroller.fill")
@@ -63,6 +65,7 @@ struct HomeView: View {
                 } else {
                     Text("最近")
                         .font(.system(size: 22, weight: .bold))
+
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 16) {
                             ForEach(store.games.prefix(6)) { game in
