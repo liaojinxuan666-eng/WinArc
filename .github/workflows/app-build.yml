@@ -1,0 +1,100 @@
+name: WinArc App Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/app-build.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/app-build.yml"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout WinArc
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode_16.4.app/Contents/Developer ]; then
+            sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          fi
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd app
+          xcodegen generate
+          test -d WinArc.xcodeproj
+
+      - name: Build unsigned iOS app
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build
+          xcodebuild \
+            -project app/WinArc.xcodeproj \
+            -scheme WinArc \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tee app-build.log
+
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' | head -1)"
+          test -n "$APP"
+          test -d "$APP"
+
+          rm -rf build/Payload
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/WinArc.app
+
+          (
+            cd build
+            /usr/bin/zip -qry WinArc-unsigned.ipa Payload
+          )
+
+          test -s build/WinArc-unsigned.ipa
+          echo "WINARC_APP_BUILD=PASS"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinArc-unsigned-ipa
+          path: build/WinArc-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinArc-app-build-log
+          path: app-build.log
+          if-no-files-found: warn
