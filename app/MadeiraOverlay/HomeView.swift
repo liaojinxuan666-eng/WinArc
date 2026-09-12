@@ -1,5 +1,9 @@
 import SwiftUI
 
+extension Notification.Name {
+    static let winArcLaunchDesktop = Notification.Name("WinArcLaunchDesktop")
+}
+
 struct HomeView: View {
     @EnvironmentObject private var store: WinArcStore
     let onCreateContainer: () -> Void
@@ -52,26 +56,26 @@ struct HomeView: View {
                     ZStack {
                         RoundedRectangle(cornerRadius: 14, style: .continuous)
                             .fill(Color.blue.opacity(0.16))
-                        Image(systemName: "shippingbox.fill")
+                        Image(systemName: "desktopcomputer")
                             .font(.system(size: 25, weight: .semibold))
                             .foregroundStyle(.blue)
                     }
                     .frame(width: 52, height: 52)
 
                     VStack(alignment: .leading, spacing: 5) {
-                        Text("Madeira Runtime")
+                        Text("Windows 桌面测试")
                             .font(.system(size: 17, weight: .semibold))
-                        Text("Madeira 地基已接入 WinArc UI")
+                        Text("WinArc UI → Madeira Runtime → Wine Desktop")
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(WinArcTheme.secondary)
-                        Text("当前只替换产品界面；Madeira 原运行控制完整保留，避免接 UI 时改坏 Wine/FEX/Winios。")
+                        Text("先验证完整 Wine 桌面启动链；成功后游戏库直接接到同一条运行链。")
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(.white.opacity(0.42))
                     }
 
                     Spacer()
 
-                    Button("运行控制") {
+                    Button("启动桌面") {
                         showMadeiraRuntime = true
                     }
                     .buttonStyle(.borderedProminent)
@@ -111,16 +115,32 @@ struct HomeView: View {
             .padding(.vertical, 10)
         }
         .fullScreenCover(isPresented: $showMadeiraRuntime) {
-            NavigationStack {
+            ZStack(alignment: .topLeading) {
                 MadeiraLegacyContentView()
-                    .toolbar {
-                        ToolbarItem(placement: .topBarLeading) {
-                            Button("返回 WinArc") {
-                                showMadeiraRuntime = false
-                            }
+                    .onAppear {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                            NotificationCenter.default.post(
+                                name: .winArcLaunchDesktop,
+                                object: nil
+                            )
                         }
                     }
+
+                Button {
+                    showMadeiraRuntime = false
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 18, weight: .bold))
+                        .frame(width: 42, height: 42)
+                        .background(.black.opacity(0.55))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 12)
+                .padding(.top, 8)
+                .zIndex(100)
             }
+            .background(Color.black)
         }
     }
 }
