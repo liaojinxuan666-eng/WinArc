@@ -1,0 +1,273 @@
+name: WinArc Madeira Base Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "app/WinArc/**"
+      - "app/MadeiraOverlay/**"
+      - "app/madeira-ui-overlay.py"
+      - ".github/workflows/madeira-base-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  dependencies:
+    name: Build Madeira ${{ matrix.component }}
+    runs-on: macos-15
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [fex, llvm, wine]
+
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      MADEIRA_COMMIT: daabd75fc4b09ab32196a2eec010537bf018e108
+
+    steps:
+      - name: Select Xcode 26.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d "$DEVELOPER_DIR"
+          xcodebuild -version
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake ninja
+          if [ "${{ matrix.component }}" = "wine" ]; then
+            brew install bison llvm gnutls pkg-config
+          fi
+
+      - name: Checkout pinned Madeira base
+        shell: bash
+        run: |
+          set -euo pipefail
+          M="$RUNNER_TEMP/Madeira"
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/arjunyerevan95-dot/Madeira.git "$M"
+          git -C "$M" checkout "$MADEIRA_COMMIT"
+          test "$(git -C "$M" rev-parse HEAD)" = "$MADEIRA_COMMIT"
+
+      - name: Build ${{ matrix.component }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          M="$RUNNER_TEMP/Madeira"
+          cd "$M"
+          bash scripts/ci-build-dependency.sh "${{ matrix.component }}" \
+            2>&1 | tee "ci-output/${{ matrix.component }}-build.log"
+          test -s "ci-output/${{ matrix.component }}-ios.tar.gz"
+          test -s "ci-output/${{ matrix.component }}-sha256.txt"
+
+      - name: Upload ${{ matrix.component }} package
+        uses: actions/upload-artifact@v4
+        with:
+          name: madeira-${{ matrix.component }}
+          path: |
+            ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-ios.tar.gz
+            ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-sha256.txt
+            ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-source-commit.txt
+            ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-build.log
+          if-no-files-found: error
+          retention-days: 7
+
+  app:
+    name: Build WinArc app on Madeira
+    needs: dependencies
+    runs-on: macos-15
+    timeout-minutes: 120
+
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      MADEIRA_COMMIT: daabd75fc4b09ab32196a2eec010537bf018e108
+
+    steps:
+      - name: Checkout WinArc
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d "$DEVELOPER_DIR"
+          xcodebuild -version
+
+      - name: Install app build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake ninja
+
+      - name: Checkout pinned Madeira base
+        shell: bash
+        run: |
+          set -euo pipefail
+          M="$RUNNER_TEMP/Madeira"
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/arjunyerevan95-dot/Madeira.git "$M"
+          git -C "$M" checkout "$MADEIRA_COMMIT"
+          test "$(git -C "$M" rev-parse HEAD)" = "$MADEIRA_COMMIT"
+
+      - name: Attach WinArc UI to Madeira app
+        shell: bash
+        run: |
+          set -euo pipefail
+          M="$RUNNER_TEMP/Madeira"
+          python3 app/madeira-ui-overlay.py "$M" "$GITHUB_WORKSPACE" \
+            | tee madeira-ui-overlay.log
+
+          grep -Fx "WINARC_MADEIRA_UI_OVERLAY=PASS" madeira-ui-overlay.log
+
+          grep -F "struct MadeiraLegacyContentView: View" \
+            "$M/app/Madeira/ContentView.swift"
+
+          grep -F "struct RootView: View" \
+            "$M/app/Madeira/ContentView.swift"
+
+          grep -F "RootView()" \
+            "$M/app/Madeira/MadeiraApp.swift"
+
+      - name: Download Madeira FEX package
+        uses: actions/download-artifact@v4
+        with:
+          name: madeira-fex
+          path: ${{ runner.temp }}/Madeira/build-inputs/fex
+
+      - name: Download Madeira LLVM package
+        uses: actions/download-artifact@v4
+        with:
+          name: madeira-llvm
+          path: ${{ runner.temp }}/Madeira/build-inputs/llvm
+
+      - name: Download Madeira Wine package
+        uses: actions/download-artifact@v4
+        with:
+          name: madeira-wine
+          path: ${{ runner.temp }}/Madeira/build-inputs/wine
+
+      - name: Verify dependency inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          M="$RUNNER_TEMP/Madeira"
+
+          for component in fex llvm wine; do
+            test -s "$M/build-inputs/$component/$component-ios.tar.gz"
+            test -s "$M/build-inputs/$component/$component-sha256.txt"
+          done
+
+      - name: Build complete Madeira runtime with WinArc UI
+        shell: bash
+        run: |
+          set -euo pipefail
+          M="$RUNNER_TEMP/Madeira"
+
+          python3 - "$M/scripts/ci-build-app.sh" <<'PY'
+          from pathlib import Path
+          import sys
+
+          p = Path(sys.argv[1])
+          s = p.read_text()
+
+          old = "PRODUCT_BUNDLE_IDENTIFIER=com.madeira.emulator"
+
+          if old not in s:
+              raise SystemExit("Madeira bundle-id build argument changed")
+
+          p.write_text(
+              s.replace(
+                  old,
+                  "PRODUCT_BUNDLE_IDENTIFIER=com.winarc.app",
+                  1
+              )
+          )
+          PY
+
+          cd "$M"
+
+          bash scripts/ci-build-app.sh \
+            2>&1 | tee ci-output/winarc-app-build.log
+
+          test -s ci-output/Madeira-unsigned.ipa
+
+      - name: Repackage as WinArc IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          M="$RUNNER_TEMP/Madeira"
+          P="$RUNNER_TEMP/WinArcPackage"
+          OUT="$GITHUB_WORKSPACE/WinArc-Madeira-base-unsigned.ipa"
+
+          rm -rf "$P"
+          mkdir -p "$P"
+
+          unzip -q \
+            "$M/ci-output/Madeira-unsigned.ipa" \
+            -d "$P"
+
+          test -d "$P/Payload/Madeira.app"
+
+          mv \
+            "$P/Payload/Madeira.app" \
+            "$P/Payload/WinArc.app"
+
+          test -s "$P/Payload/WinArc.app/Madeira"
+
+          DISPLAY="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleDisplayName' \
+              "$P/Payload/WinArc.app/Info.plist"
+          )"
+
+          BUNDLE_ID="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleIdentifier' \
+              "$P/Payload/WinArc.app/Info.plist"
+          )"
+
+          test "$DISPLAY" = "WinArc"
+          test "$BUNDLE_ID" = "com.winarc.app"
+
+          (
+            cd "$P"
+            /usr/bin/zip -qry "$OUT" Payload
+          )
+
+          test -s "$OUT"
+
+          unzip -t "$OUT" | tail -1
+
+          echo "WINARC_PRODUCT_UI=PASS"
+          echo "WINARC_MADEIRA_RUNTIME_BASE=PASS"
+          echo "WINARC_MADEIRA_IPA=PASS"
+
+      - name: Upload WinArc Madeira IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinArc-Madeira-base-unsigned-ipa
+          path: WinArc-Madeira-base-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload integration diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinArc-Madeira-base-logs
+          path: |
+            madeira-ui-overlay.log
+            ${{ runner.temp }}/Madeira/ci-output/app-build.log
+            ${{ runner.temp }}/Madeira/ci-output/winarc-app-build.log
+            ${{ runner.temp }}/Madeira/ci-output/linked-libraries.txt
+            ${{ runner.temp }}/Madeira/build/dxmt-ios/obj/*.err
+          if-no-files-found: warn
+          retention-days: 14
