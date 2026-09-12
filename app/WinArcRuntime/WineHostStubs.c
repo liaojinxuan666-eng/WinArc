@@ -4,15 +4,17 @@
  * These definitions exist ONLY to close the iOS host side of the Revision-9
  * reference archive during the first executable-link/device-probe stage.
  *
- * They are intentionally minimal: no Wine execution is started in v0.0.2.
+ * They are intentionally minimal: no Wine execution is started in WinArc 0.0.1.
  * Window/display/DXMT callbacks are replaced later by WinArc-owned runtime
  * implementations as each subsystem is enabled.
  */
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <libkern/OSCacheControl.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -24,6 +26,23 @@ _Thread_local jmp_buf wine_ios_exit_jmpbuf;
 _Thread_local volatile int wine_ios_exit_code = 0;
 _Thread_local pthread_t wine_ios_main_thread;
 _Thread_local int wine_ios_exit_initialized = 0;
+
+/* ------------------------------------------------------------------------- */
+/* iOS instruction-cache bridge.                                              */
+/*                                                                           */
+/* Wine's Unix-side ARM64 code calls the compiler-style __clear_cache helper  */
+/* after changing executable code. The iPhoneOS final link does not export    */
+/* that symbol for us, so map it to Darwin's public instruction-cache API.    */
+/* ------------------------------------------------------------------------- */
+
+void __clear_cache(void *start, void *end)
+{
+    uintptr_t begin = (uintptr_t)start;
+    uintptr_t finish = (uintptr_t)end;
+
+    if (!begin || finish <= begin) return;
+    sys_icache_invalidate((void *)begin, (size_t)(finish - begin));
+}
 
 /* ------------------------------------------------------------------------- */
 /* wineserver host state.                                                     */
@@ -49,7 +68,7 @@ const char wine_build[] = "wine-11.4-ios-winarc-reference";
 
 /* ------------------------------------------------------------------------- */
 /* iOS does not expose the macOS IOPowerSources API used by desktop Wine.     */
-/* Madeira solves the same final-link gap with null-returning host stubs.      */
+/* The reference build closes those imports with null-returning host stubs.   */
 /* ------------------------------------------------------------------------- */
 
 CFTypeRef IOPSCopyPowerSourcesInfo(void)
@@ -71,8 +90,8 @@ CFDictionaryRef IOPSGetPowerSourceDescription(CFTypeRef blob, CFTypeRef source)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Graphics backend boundary. v0.0.2 only links/probes Wine; no DXMT call is  */
-/* allowed yet, so the table is deliberately null.                            */
+/* Graphics backend boundary. WinArc 0.0.1 currently only links/probes Wine;  */
+/* no DXMT call is allowed yet, so the table is deliberately null.             */
 /* ------------------------------------------------------------------------- */
 
 void *dxmt_winemetal_unix_call_funcs = NULL;
