@@ -529,6 +529,13 @@ void winios_surface_present(void *hwnd,
 
         if (image)
         {
+            /*
+             * A real guest GDI surface made it to the iOS compositor.
+             * "仅游戏加载日志" can stop here; this keeps runtime I/O out of
+             * normal gameplay while preserving the full startup trail.
+             */
+            winarc_runtime_log_note_first_present();
+
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
 

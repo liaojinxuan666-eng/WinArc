@@ -4,6 +4,10 @@ import SwiftUI
 struct WinArcApp: App {
     @StateObject private var store = WinArcStore()
 
+    init() {
+        WinArcRuntimeLog.configureForAppLaunch()
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()

@@ -53,8 +53,11 @@ struct RuntimeStatusView: View {
         .padding(18)
         .winArcGlass()
         .onAppear {
-            WinArcRuntimeLog.install()
-            WinArcRuntimeLog.mark("UI", "RuntimeStatusView appeared")
+            WinArcRuntimeLog.configureForAppLaunch()
+            WinArcRuntimeLog.mark(
+                "UI",
+                "RuntimeStatusView appeared"
+            )
             probe()
         }
         .onReceive(refreshTimer) { _ in
@@ -418,11 +421,21 @@ struct RuntimeStatusView: View {
     }
 
     private func startWineServer() {
-        WinArcRuntimeLog.install()
-        WinArcRuntimeLog.mark("UI", "start wineserver tapped")
+        /*
+         * In game-loading mode we intentionally do NOT begin capture here.
+         * The launch-only log begins when the game/Wine client is actually
+         * started, so leaving wineserver idle does not generate a huge log.
+         */
+        WinArcRuntimeLog.mark(
+            "UI",
+            "start wineserver tapped"
+        )
 
         guard linked, let paths = runtimePaths() else {
-            WinArcRuntimeLog.mark("UI", "start wineserver aborted before C bridge")
+            WinArcRuntimeLog.mark(
+                "UI",
+                "start wineserver aborted before C bridge"
+            )
             return
         }
 
@@ -441,8 +454,16 @@ struct RuntimeStatusView: View {
     }
 
     private func startWineDesktop() {
-        WinArcRuntimeLog.install()
-        WinArcRuntimeLog.mark("UI", "start Wine desktop tapped")
+        /*
+         * This is the current development stand-in for a real game launch.
+         * Later the library launcher calls the same beginGameLoadingCapture()
+         * immediately before starting game.exe.
+         */
+        WinArcRuntimeLog.beginGameLoadingCapture()
+        WinArcRuntimeLog.mark(
+            "UI",
+            "start Wine desktop tapped"
+        )
 
         guard linked,
               serverState == Int32(WINARC_WINESERVER_RUNNING),

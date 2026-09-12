@@ -1,112 +1,32 @@
-import Foundation
 import SwiftUI
-
-enum WinArcRuntimeLog {
-    static var directoryURL: URL {
-        FileManager.default.urls(
-            for: .documentDirectory,
-            in: .userDomainMask
-        )[0]
-        .appendingPathComponent("WinArcLogs", isDirectory: true)
-    }
-
-    static var fileURL: URL {
-        directoryURL.appendingPathComponent("winarc-runtime.log")
-    }
-
-    @discardableResult
-    static func install() -> Bool {
-        do {
-            try FileManager.default.createDirectory(
-                at: directoryURL,
-                withIntermediateDirectories: true
-            )
-        } catch {
-            return false
-        }
-
-        return fileURL.path.withCString {
-            winarc_runtime_log_install($0) >= 0
-        }
-    }
-
-    static func mark(_ subsystem: String, _ message: String) {
-        install()
-
-        subsystem.withCString { subsystemCString in
-            message.withCString { messageCString in
-                winarc_runtime_log_mark(
-                    subsystemCString,
-                    messageCString
-                )
-            }
-        }
-    }
-
-    static func tail(maxBytes: Int = 512 * 1024) -> String {
-        let url = fileURL
-
-        guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return "还没有运行日志。"
-        }
-
-        defer {
-            try? handle.close()
-        }
-
-        let end = (try? handle.seekToEnd()) ?? 0
-        let start = end > UInt64(maxBytes)
-            ? end - UInt64(maxBytes)
-            : 0
-
-        try? handle.seek(toOffset: start)
-
-        guard let data = try? handle.readToEnd(),
-              let data,
-              !data.isEmpty else {
-            return "日志文件为空。"
-        }
-
-        var text = String(decoding: data, as: UTF8.self)
-
-        if start > 0 {
-            if let newline = text.firstIndex(of: "\n") {
-                text = String(text[text.index(after: newline)...])
-            }
-            text = "……仅显示最后 \(maxBytes / 1024) KB……\n" + text
-        }
-
-        return text
-    }
-
-    static func clear() {
-        install()
-
-        guard let handle = try? FileHandle(forWritingTo: fileURL) else {
-            return
-        }
-
-        try? handle.truncate(atOffset: 0)
-        try? handle.synchronize()
-        try? handle.close()
-
-        mark("LOG", "log cleared")
-    }
-}
 
 struct RuntimeLogView: View {
     @Environment(\.dismiss) private var dismiss
 
+    @AppStorage(WinArcRuntimeLog.showLiveKey)
+    private var showLiveLog = false
+
     @State private var logText = ""
     @State private var refreshID = 0
+
+    private let timer = Timer.publish(
+        every: 1.0,
+        on: .main,
+        in: .common
+    ).autoconnect()
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 12) {
                 HStack(spacing: 10) {
                     Label(
-                        "闪退后重新打开 WinArc，这里仍能看到闪退前最后写入的阶段。",
-                        systemImage: "exclamationmark.triangle"
+                        WinArcRuntimeLog.isCapturing
+                            ? "当前正在写入日志。"
+                            : "当前没有写入；历史日志仍可查看和导出。",
+                        systemImage:
+                            WinArcRuntimeLog.isCapturing
+                                ? "record.circle"
+                                : "doc.text"
                     )
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -116,7 +36,12 @@ struct RuntimeLogView: View {
 
                 ScrollView([.vertical, .horizontal]) {
                     Text(logText)
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(
+                            .system(
+                                size: 11,
+                                design: .monospaced
+                            )
+                        )
                         .textSelection(.enabled)
                         .frame(
                             maxWidth: .infinity,
@@ -135,30 +60,48 @@ struct RuntimeLogView: View {
             .padding(16)
             .navigationTitle("WinArc 运行日志")
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
+                ToolbarItem(
+                    placement: .cancellationAction
+                ) {
                     Button("关闭") {
                         dismiss()
                     }
                 }
 
-                ToolbarItemGroup(placement: .primaryAction) {
+                ToolbarItemGroup(
+                    placement: .primaryAction
+                ) {
                     Button("刷新") {
                         reload()
                     }
 
-                    Button("清空", role: .destructive) {
+                    Button(
+                        "清空",
+                        role: .destructive
+                    ) {
                         WinArcRuntimeLog.clear()
                         reload()
                     }
 
-                    ShareLink(item: WinArcRuntimeLog.fileURL) {
-                        Label("导出", systemImage: "square.and.arrow.up")
+                    ShareLink(
+                        item: WinArcRuntimeLog.fileURL
+                    ) {
+                        Label(
+                            "导出",
+                            systemImage: "square.and.arrow.up"
+                        )
                     }
                 }
             }
             .onAppear {
-                WinArcRuntimeLog.install()
+                WinArcRuntimeLog.ensureLogFileExists()
                 reload()
+            }
+            .onReceive(timer) { _ in
+                if showLiveLog &&
+                   WinArcRuntimeLog.isCapturing {
+                    reload()
+                }
             }
             .id(refreshID)
         }
@@ -167,5 +110,75 @@ struct RuntimeLogView: View {
     private func reload() {
         logText = WinArcRuntimeLog.tail()
         refreshID &+= 1
+    }
+}
+
+struct RuntimeLiveLogPanel: View {
+    @State private var text = ""
+
+    private let timer = Timer.publish(
+        every: 1.0,
+        on: .main,
+        in: .common
+    ).autoconnect()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(
+                    "实时日志",
+                    systemImage: "terminal"
+                )
+                .font(.caption.weight(.semibold))
+
+                Spacer()
+
+                Text(
+                    WinArcRuntimeLog.isCapturing
+                        ? "REC"
+                        : "IDLE"
+                )
+                .font(.caption2.monospaced().weight(.bold))
+                .foregroundStyle(
+                    WinArcRuntimeLog.isCapturing
+                        ? .green
+                        : .secondary
+                )
+            }
+
+            ScrollView(.vertical) {
+                Text(text)
+                    .font(
+                        .system(
+                            size: 9,
+                            design: .monospaced
+                        )
+                    )
+                    .frame(
+                        maxWidth: .infinity,
+                        alignment: .topLeading
+                    )
+                    .textSelection(.enabled)
+            }
+            .frame(height: 120)
+        }
+        .padding(14)
+        .background(.black.opacity(0.30))
+        .clipShape(
+            RoundedRectangle(
+                cornerRadius: 16,
+                style: .continuous
+            )
+        )
+        .onAppear(perform: reload)
+        .onReceive(timer) { _ in
+            reload()
+        }
+    }
+
+    private func reload() {
+        text = WinArcRuntimeLog.tail(
+            maxBytes: 24 * 1024
+        )
     }
 }

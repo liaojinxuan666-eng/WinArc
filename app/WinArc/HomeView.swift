@@ -1,6 +1,8 @@
 import SwiftUI
 
 struct HomeView: View {
+    @AppStorage(WinArcRuntimeLog.showLiveKey)
+    private var showLiveLog = false
     @EnvironmentObject private var store: WinArcStore
     let onCreateContainer: () -> Void
     let onImportGame: () -> Void
@@ -47,6 +49,11 @@ struct HomeView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
 
                 RuntimeStatusView()
+
+                if showLiveLog {
+                    RuntimeLiveLogPanel()
+                        .winArcGlass()
+                }
 
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
