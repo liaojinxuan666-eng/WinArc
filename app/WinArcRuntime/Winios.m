@@ -12,6 +12,7 @@
  */
 
 #import "Winios.h"
+#import "RuntimeLogBridge.h"
 
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
