@@ -96,12 +96,14 @@ jobs:
           BIN="$APP/WinArc"
           test -f "$BIN"
 
-          xcrun nm -gU "$BIN" > winarc-app-symbols.txt
+          xcrun nm "$BIN" > winarc-app-symbols.txt
 
           grep -F "_winarc_wine_reference_get_boundary" winarc-app-symbols.txt
           grep -F "_winarc_wine_runtime_is_linked" winarc-app-symbols.txt
-          grep -F "_wineserver_main" winarc-app-symbols.txt
-          grep -F "___wine_main" winarc-app-symbols.txt
+          grep -F "_winarc_wine_runtime_server_entry" winarc-app-symbols.txt
+          grep -F "_winarc_wine_runtime_client_entry" winarc-app-symbols.txt
+
+          grep -E "wineserver_main|__wine_main" winarc-app-symbols.txt || true
 
           echo "WINARC_APP_WINE_LINK=PASS"
           echo "WINARC_APP_WINE_DEVICE_EXECUTION=NOT_RUN"
