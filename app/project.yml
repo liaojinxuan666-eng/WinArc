@@ -1,0 +1,31 @@
+name: WinArc
+options:
+  bundleIdPrefix: com.winarc
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: 5.0
+    TARGETED_DEVICE_FAMILY: "1,2"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+targets:
+  WinArc:
+    type: application
+    platform: iOS
+    sources:
+      - path: WinArc
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.winarc.app
+        INFOPLIST_KEY_CFBundleDisplayName: WinArc
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UIRequiresFullScreen: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone:
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad:
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        GENERATE_INFOPLIST_FILE: YES
