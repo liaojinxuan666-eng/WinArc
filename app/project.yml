@@ -38,10 +38,9 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_OBJC_BRIDGING_HEADER: WinArc/WinArc-Bridging-Header.h
 
-        # Runtime bring-up: deliberately keep symbols visible while we prove
-        # that Wine is inside the same Mach-O as the WinArc shell.
         DEAD_CODE_STRIPPING: NO
         STRIP_INSTALLED_PRODUCT: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
 
         OTHER_LDFLAGS: >-
           $(inherited)
@@ -52,3 +51,20 @@ targets:
           -framework AudioToolbox
           -framework AVFoundation
           -framework IOKit
+
+    postBuildScripts:
+      - name: Stage Wine NLS
+        script: |
+          set -euo pipefail
+
+          NLS_SRC="${SRCROOT}/../wine/build/madeira-wine-reference-src/app/Madeira/nls"
+          APP_RES="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+          NLS_DST="${APP_RES}/nls"
+
+          test -d "${NLS_SRC}"
+          mkdir -p "${APP_RES}"
+          rm -rf "${NLS_DST}"
+          /usr/bin/ditto "${NLS_SRC}" "${NLS_DST}"
+
+          test -d "${NLS_DST}"
+          echo "WINARC_WINE_NLS_BUNDLED=PASS"

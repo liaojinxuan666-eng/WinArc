@@ -1,12 +1,9 @@
 /*
- * WinArc Wine host boundary - bring-up stubs.
+ * WinArc Wine host boundary.
  *
- * These definitions exist ONLY to close the iOS host side of the Revision-9
- * reference archive during the first executable-link/device-probe stage.
- *
- * They are intentionally minimal: no Wine execution is started in WinArc 0.0.1.
- * Window/display/DXMT callbacks are replaced later by WinArc-owned runtime
- * implementations as each subsystem is enabled.
+ * WinArc 0.0.1 is now entering the first device-execution bring-up stage:
+ * wineserver may run as a pthread, while the Windows client is still disabled.
+ * Display/DXMT callbacks remain inert until the client path is enabled.
  */
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -17,6 +14,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+
+/* Report a server-side fatal startup error back to the Swift status panel. */
+extern void winarc_wine_runtime_report_fatal(const char *message);
 
 /* ------------------------------------------------------------------------- */
 /* Wine/iOS process-exit state expected by the ntdll iOS exit shim.           */
@@ -29,10 +29,6 @@ _Thread_local int wine_ios_exit_initialized = 0;
 
 /* ------------------------------------------------------------------------- */
 /* iOS instruction-cache bridge.                                              */
-/*                                                                           */
-/* Wine's Unix-side ARM64 code calls the compiler-style __clear_cache helper  */
-/* after changing executable code. The iPhoneOS final link does not export    */
-/* that symbol for us, so map it to Darwin's public instruction-cache API.    */
 /* ------------------------------------------------------------------------- */
 
 void __clear_cache(void *start, void *end)
@@ -52,14 +48,24 @@ volatile int g_wineserver_should_stop = 0;
 
 void fatal_error(const char *format, ...)
 {
+    char buffer[1024];
     va_list args;
+
     va_start(args, format);
-    fputs("[WinArc/Wine] fatal_error: ", stderr);
-    if (format) vfprintf(stderr, format, args);
-    fputc('\n', stderr);
+    vsnprintf(buffer, sizeof(buffer),
+              format ? format : "unknown wineserver fatal error",
+              args);
     va_end(args);
 
-    /* Never kill the UIKit process from the wineserver path. */
+    fprintf(stderr, "[WinArc/Wine] fatal_error: %s\n", buffer);
+    fflush(stderr);
+
+    winarc_wine_runtime_report_fatal(buffer);
+
+    /*
+     * Critical iOS rule: wineserver and UIKit share one process.
+     * A normal Wine exit(1) here would kill WinArc itself.
+     */
     pthread_exit(NULL);
 }
 
@@ -67,8 +73,7 @@ void fatal_error(const char *format, ...)
 const char wine_build[] = "wine-11.4-ios-winarc-reference";
 
 /* ------------------------------------------------------------------------- */
-/* iOS does not expose the macOS IOPowerSources API used by desktop Wine.     */
-/* The reference build closes those imports with null-returning host stubs.   */
+/* iOS power-source compatibility stubs.                                      */
 /* ------------------------------------------------------------------------- */
 
 CFTypeRef IOPSCopyPowerSourcesInfo(void)
@@ -90,15 +95,13 @@ CFDictionaryRef IOPSGetPowerSourceDescription(CFTypeRef blob, CFTypeRef source)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Graphics backend boundary. WinArc 0.0.1 currently only links/probes Wine;  */
-/* no DXMT call is allowed yet, so the table is deliberately null.             */
+/* Graphics backend boundary. Client execution is not enabled in this stage.  */
 /* ------------------------------------------------------------------------- */
 
 void *dxmt_winemetal_unix_call_funcs = NULL;
 
 /* ------------------------------------------------------------------------- */
 /* Minimal display-driver host hooks.                                         */
-/* They close weak/user-driver references without creating UIKit surfaces.    */
 /* ------------------------------------------------------------------------- */
 
 int winios_pCreateWindow(void *hwnd)
