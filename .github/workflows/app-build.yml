@@ -65,6 +65,8 @@ jobs:
           grep -Fx "WINARC_WINE_BOOTSTRAP=PASS" wine-runtime-bootstrap.log
 
           test -s wine/build/winarc-wine-reference-link/libWinArcWineReference.a
+          test -s wine/build/madeira-wine-reference-src/app/Madeira/prefix-template.tar.gz
+          test -s wine/build/madeira-wine-reference-src/app/Madeira/aarch64-windows/explorer.exe
 
       - name: Build DXMT host backend
         shell: bash
@@ -76,11 +78,9 @@ jobs:
           GRAPHICS="$GITHUB_WORKSPACE/wine/build/graphics"
 
           DXMT_ARCHIVE="$REF/app/libdxmt_unix.a"
-
           test -s "$DXMT_ARCHIVE"
 
-          mkdir -p "$CACHE"
-          mkdir -p "$GRAPHICS"
+          mkdir -p "$CACHE" "$GRAPHICS"
 
           if ! test -s "$CACHE/llvm-ios-build/lib/libLLVMPasses.a"; then
 
@@ -103,16 +103,10 @@ jobs:
           s = p.read_text()
 
           old = 'MATCHES "Darwin"'
-
           if old not in s:
               raise SystemExit("LLVM Darwin linker condition not found")
 
-          p.write_text(
-              s.replace(
-                  old,
-                  'MATCHES "Darwin|iOS"'
-              )
-          )
+          p.write_text(s.replace(old, 'MATCHES "Darwin|iOS"'))
           PY
 
             SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
@@ -180,18 +174,12 @@ jobs:
             "$CACHE"/llvm-ios-build/lib/*.a
 
           test -s "$GRAPHICS/libWinArcDXMT.a"
+          xcrun lipo "$GRAPHICS/libWinArcDXMT.a" -verify_arch arm64
 
-          xcrun lipo \
-            "$GRAPHICS/libWinArcDXMT.a" \
-            -verify_arch arm64
-
-          xcrun nm \
-            -gU \
-            "$GRAPHICS/libWinArcDXMT.a" \
+          xcrun nm -gU "$GRAPHICS/libWinArcDXMT.a" \
             > "$GRAPHICS/dxmt-symbols.txt"
 
-          grep -F \
-            "_dxmt_winemetal_unix_call_funcs" \
+          grep -F "_dxmt_winemetal_unix_call_funcs" \
             "$GRAPHICS/dxmt-symbols.txt"
 
           echo "WINARC_DXMT_HOST_ARCHIVE=PASS"
@@ -202,12 +190,10 @@ jobs:
           set -euo pipefail
 
           cd app
-
           xcodegen generate
-
           test -d WinArc.xcodeproj
 
-      - name: Build WinArc graphics runtime app
+      - name: Build WinArc Wine desktop app
         shell: bash
         run: |
           set -euo pipefail
@@ -226,7 +212,7 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build | tee app-build.log
 
-      - name: Verify final Mach-O contains Wine and DXMT
+      - name: Verify Wine desktop chain
         shell: bash
         run: |
           set -euo pipefail
@@ -244,51 +230,40 @@ jobs:
           test -d "$APP"
 
           BIN="$APP/WinArc"
-
           test -f "$BIN"
 
           xcrun nm "$BIN" > winarc-app-symbols.txt
 
-          grep -F \
-            "_winarc_wine_reference_get_boundary" \
-            winarc-app-symbols.txt
+          grep -F "_winarc_wine_reference_get_boundary" winarc-app-symbols.txt
+          grep -F "_winarc_wine_runtime_start_server" winarc-app-symbols.txt
+          grep -F "_winarc_wine_runtime_start_desktop" winarc-app-symbols.txt
 
-          grep -F \
-            "_winarc_wine_runtime_is_linked" \
-            winarc-app-symbols.txt
+          grep -F "_wineserver_inject_client_fd" winarc-app-symbols.txt
+          grep -F "___wine_main" winarc-app-symbols.txt
 
-          grep -F \
-            "_winarc_wine_runtime_server_entry" \
-            winarc-app-symbols.txt
+          grep -F "_winios_surface_present" winarc-app-symbols.txt
+          grep -F "_winios_window_frame" winarc-app-symbols.txt
+          grep -F "_winios_metal_layer_for_hwnd" winarc-app-symbols.txt
 
-          grep -F \
-            "_winarc_wine_runtime_client_entry" \
-            winarc-app-symbols.txt
+          grep -F "_dxmt_winemetal_unix_call_funcs" winarc-app-symbols.txt
+          grep -F "_macdrv_functions" winarc-app-symbols.txt
 
-          grep -F \
-            "_dxmt_winemetal_unix_call_funcs" \
-            winarc-app-symbols.txt
+          test -f "$APP/WinArcPrefixTemplate/system.reg"
+          test -f "$APP/WinArcPrefixTemplate/user.reg"
 
-          grep -F \
-            "_macdrv_functions" \
-            winarc-app-symbols.txt
-
-          grep -F \
-            "_winarc_graphics_backend_status" \
-            winarc-app-symbols.txt
+          test -s "$APP/aarch64-windows/explorer.exe"
+          test -s "$APP/aarch64-windows/ntdll.dll"
+          test -s "$APP/aarch64-windows/user32.dll"
 
           test -s "$APP/aarch64-windows/d3d11.dll"
           test -s "$APP/aarch64-windows/dxgi.dll"
           test -s "$APP/aarch64-windows/winemetal.dll"
 
-          grep -E \
-            "wineserver_main|__wine_main" \
-            winarc-app-symbols.txt || true
-
           echo "WINARC_APP_WINE_LINK=PASS"
+          echo "WINARC_APP_WINE_CLIENT_LINK=PASS"
+          echo "WINARC_APP_WINIOS_COMPOSITOR=PASS"
           echo "WINARC_APP_DXMT_LINK=PASS"
-          echo "WINARC_APP_GRAPHICS_ROUTER=PASS"
-          echo "WINARC_APP_WINE_DEVICE_EXECUTION=NOT_RUN"
+          echo "WINARC_APP_WINE_DESKTOP_DEVICE_EXECUTION=NOT_RUN"
 
       - name: Package IPA
         shell: bash
@@ -308,39 +283,33 @@ jobs:
           test -d "$APP"
 
           rm -rf build/Payload
-
           mkdir -p build/Payload
 
-          cp -R \
-            "$APP" \
-            build/Payload/WinArc.app
+          cp -R "$APP" build/Payload/WinArc.app
 
           (
             cd build
-
-            /usr/bin/zip \
-              -qry \
-              WinArc-0.0.1-graphics-unsigned.ipa \
+            /usr/bin/zip -qry \
+              WinArc-0.0.1-wine-desktop-unsigned.ipa \
               Payload
           )
 
-          test -s \
-            build/WinArc-0.0.1-graphics-unsigned.ipa
+          test -s build/WinArc-0.0.1-wine-desktop-unsigned.ipa
 
           echo "WINARC_APP_BUILD=PASS"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: WinArc-0.0.1-graphics-unsigned-ipa
-          path: build/WinArc-0.0.1-graphics-unsigned.ipa
+          name: WinArc-0.0.1-wine-desktop-unsigned-ipa
+          path: build/WinArc-0.0.1-wine-desktop-unsigned.ipa
           if-no-files-found: error
 
       - name: Upload runtime logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: WinArc-0.0.1-graphics-logs
+          name: WinArc-0.0.1-wine-desktop-logs
           path: |
             app-build.log
             wine-runtime-bootstrap.log
