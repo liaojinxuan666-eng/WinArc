@@ -212,6 +212,48 @@ stock_ready_patched = '''        LogStore.shared.log("JIT pool ready (debugger s
 if stock_ready in jit_source:
     jit_source = jit_source.replace(stock_ready, stock_ready_patched, 1)
 
+
+# WinArc JIT Core v0.4:
+# On this device the local pool now reaches READY, but the process disappears
+# inside jit26_detach() before "Debugger detached." can be logged.
+#
+# Keep StikDebug attached for the Local Dual Map path so Wine/FEX can continue
+# and so later BRK-based PE page preparation remains available. The stock
+# Madeira detach behavior is preserved for every non-WinArc-local strategy.
+detach_old = '''    static func detachDebugger() {
+        LogStore.shared.log("Detaching debugger...")
+        jit26_detach()
+        // task #34: signal in-process waiters (share-probe poller). CS_DEBUGGED
+        // is sticky post-detach, so an env flag is the reliable signal.
+        setenv("MADEIRA_DETACHED", "1", 1)
+        LogStore.shared.log("Debugger detached.", level: .success)
+    }
+'''
+
+detach_new = '''    static func detachDebugger() {
+        if ProcessInfo.processInfo.environment["WINARC_LOCAL_JIT_POOL"] == "1" {
+            LogStore.shared.log(
+                "WinArc JIT: KEEPING debugger attached " +
+                "(jit26_detach crashes on current device)"
+            )
+            unsetenv("MADEIRA_DETACHED")
+            return
+        }
+
+        LogStore.shared.log("Detaching debugger...")
+        jit26_detach()
+        // task #34: signal in-process waiters (share-probe poller). CS_DEBUGGED
+        // is sticky post-detach, so an env flag is the reliable signal.
+        setenv("MADEIRA_DETACHED", "1", 1)
+        LogStore.shared.log("Debugger detached.", level: .success)
+    }
+'''
+
+if 'WinArc JIT: KEEPING debugger attached' not in jit_source:
+    if detach_old not in jit_source:
+        raise SystemExit("Madeira StikJITHelper detachDebugger() shape changed")
+    jit_source = jit_source.replace(detach_old, detach_new, 1)
+
 jit_helper_path.write_text(jit_source, encoding="utf-8")
 
 ui_files = [
@@ -365,11 +407,13 @@ assert "winarc_graphics_backend_status_text" not in generated
 assert ".winArcLaunchDesktop" in generated
 assert ".winArcJITPoolReady" in generated
 assert "WinArc JIT Core v0.3" in jit_generated
+assert "WinArc JIT: KEEPING debugger attached" in jit_generated
 assert "SKIPPING debugger prepare" in jit_generated
 
 print("WINARC_MADEIRA_UI_OVERLAY=PASS")
 print("WINARC_JIT_CORE_V0=PASS")
 print("WINARC_JIT_DIRECT_LOCAL_POOL=PASS")
+print("WINARC_JIT_KEEP_DEBUGGER=PASS")
 print("WINARC_JIT_HOME_QUICK_CHECK=PASS")
 print("WINARC_JIT_SETTINGS=PASS")
 print("WINARC_JIT_RECOVERY=PASS")
