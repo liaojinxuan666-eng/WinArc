@@ -32,6 +32,41 @@ if "struct MadeiraLegacyContentView: View {" not in source:
         raise SystemExit("Madeira ContentView declaration not found")
     source = re.sub(r"\bContentView\b", "MadeiraLegacyContentView", source)
 
+
+# WinArc: the raw Metal host lives directly on UIWindow, so SwiftUI dismissing
+# the runtime cover does not remove it automatically. Keep the process-lifetime
+# singleton/layer, but detach the UIView from the window when its placeholder
+# disappears. The same singleton is re-parented on the next launch.
+metal_detach_old = '''    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        guard let w = window else { return }   // detach: leave the host be
+'''
+metal_detach_new = '''    override func didMoveToWindow() {
+        super.didMoveToWindow()
+
+        guard let w = window else {
+            if MetalBackedView.keyboardTarget === self {
+                MetalBackedView.keyboardTarget = nil
+            }
+
+            if MetalHostView.shared.superview != nil {
+                MetalHostView.shared.removeFromSuperview()
+                LogStore.shared.log(
+                    "[WinArc Metal] detached window-level host"
+                )
+            }
+
+            winios_set_compositor_frame(0, 0, 0, 0)
+            return
+        }
+'''
+
+if "[WinArc Metal] detached window-level host" not in source:
+    if metal_detach_old not in source:
+        raise SystemExit("Madeira MetalBackedView.didMoveToWindow shape changed")
+    source = source.replace(metal_detach_old, metal_detach_new, 1)
+
+
 launch_hook_old = '''            .onAppear {
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
@@ -54,7 +89,8 @@ launch_hook_new = launch_hook_old + '''            .onReceive(NotificationCenter
                 setenv("MADEIRA_SCREEN_H", String(deskH), 1)
 
                 runWineFullSequence()
-            }            .onReceive(NotificationCenter.default.publisher(for: .winArcLaunchDX11Cube)) { _ in
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .winArcLaunchDX11Cube)) { _ in
                 LogStore.shared.log(
                     "[WinArc DX11] launching bundled cube-x64.exe via DXMT"
                 )
@@ -428,6 +464,7 @@ assert re.search(
 ) is None
 assert "winarc_graphics_backend_status_text" not in generated
 assert ".winArcLaunchDesktop" in generated
+assert "[WinArc Metal] detached window-level host" in generated
 assert ".winArcLaunchDX11Cube" in generated
 assert ".winArcLaunchARM64DX11" in generated
 assert "[WinArc DX11 ARM64] calling Madeira runTriangleTest()" in generated
@@ -438,6 +475,7 @@ assert "WinArc JIT: KEEPING debugger attached" in jit_generated
 assert "SKIPPING debugger prepare" in jit_generated
 
 print("WINARC_MADEIRA_UI_OVERLAY=PASS")
+print("WINARC_METAL_HOST_CLEANUP=PASS")
 print("WINARC_DX11_CUBE_BRIDGE=PASS")
 print("WINARC_DX11_ARM64_ISOLATION=PASS")
 print("WINARC_JIT_CORE_V0=PASS")

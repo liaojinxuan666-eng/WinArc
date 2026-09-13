@@ -86,6 +86,9 @@ struct HomeView: View {
                     }
 
                 Button {
+                    MetalBackedView.keyboardTarget?.resignFirstResponder()
+                    MetalBackedView.keyboardTarget = nil
+                    MetalHostView.shared.removeFromSuperview()
                     showMadeiraRuntime = false
                 } label: {
                     Image(systemName: "chevron.left")
@@ -100,6 +103,11 @@ struct HomeView: View {
                 .zIndex(100)
             }
             .background(Color.black)
+            .onDisappear {
+                MetalBackedView.keyboardTarget?.resignFirstResponder()
+                MetalBackedView.keyboardTarget = nil
+                MetalHostView.shared.removeFromSuperview()
+            }
         }
     }
 
