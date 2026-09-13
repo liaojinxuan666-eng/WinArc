@@ -54,7 +54,20 @@ launch_hook_new = launch_hook_old + '''            .onReceive(NotificationCenter
                 setenv("MADEIRA_SCREEN_H", String(deskH), 1)
 
                 runWineFullSequence()
+            }            .onReceive(NotificationCenter.default.publisher(for: .winArcLaunchDX11Cube)) { _ in
+                LogStore.shared.log(
+                    "[WinArc DX11] launching bundled cube-x64.exe via DXMT"
+                )
+
+                setenv("MADEIRA_EXE", "cube-x64.exe", 1)
+                unsetenv("MADEIRA_ARGS")
+                unsetenv("MADEIRA_DESKTOP")
+                unsetenv("MADEIRA_SCREEN_W")
+                unsetenv("MADEIRA_SCREEN_H")
+
+                runWineFullSequence()
             }
+
 '''
 
 if ".winArcLaunchDesktop" not in source:
@@ -405,12 +418,15 @@ assert re.search(
 ) is None
 assert "winarc_graphics_backend_status_text" not in generated
 assert ".winArcLaunchDesktop" in generated
+assert ".winArcLaunchDX11Cube" in generated
+assert "cube-x64.exe" in generated
 assert ".winArcJITPoolReady" in generated
 assert "WinArc JIT Core v0.3" in jit_generated
 assert "WinArc JIT: KEEPING debugger attached" in jit_generated
 assert "SKIPPING debugger prepare" in jit_generated
 
 print("WINARC_MADEIRA_UI_OVERLAY=PASS")
+print("WINARC_DX11_CUBE_BRIDGE=PASS")
 print("WINARC_JIT_CORE_V0=PASS")
 print("WINARC_JIT_DIRECT_LOCAL_POOL=PASS")
 print("WINARC_JIT_KEEP_DEBUGGER=PASS")

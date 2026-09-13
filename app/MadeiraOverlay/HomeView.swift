@@ -1,5 +1,24 @@
 import SwiftUI
 
+extension Notification.Name {
+    static let winArcLaunchDX11Cube =
+        Notification.Name("WinArcLaunchDX11Cube")
+}
+
+private enum WinArcRuntimeLaunchTarget {
+    case desktop
+    case dx11Cube
+
+    var notification: Notification.Name {
+        switch self {
+        case .desktop:
+            return .winArcLaunchDesktop
+        case .dx11Cube:
+            return .winArcLaunchDX11Cube
+        }
+    }
+}
+
 struct HomeView: View {
     @EnvironmentObject private var store: WinArcStore
     let onCreateContainer: () -> Void
@@ -11,6 +30,7 @@ struct HomeView: View {
     @State private var showMadeiraRuntime = false
     @State private var showJITSettings = false
     @State private var showLaunchError = false
+    @State private var launchTarget: WinArcRuntimeLaunchTarget = .desktop
 
     var body: some View {
         ScrollView {
@@ -18,6 +38,7 @@ struct HomeView: View {
                 hero
                 jitCard
                 runtimeCard
+                dx11Card
                 desktopCard
                 libraryContent
             }
@@ -52,7 +73,7 @@ struct HomeView: View {
                             deadline: .now() + 0.35
                         ) {
                             NotificationCenter.default.post(
-                                name: .winArcLaunchDesktop,
+                                name: launchTarget.notification,
                                 object: nil
                             )
                         }
@@ -236,6 +257,71 @@ struct HomeView: View {
         .winArcGlass()
     }
 
+
+    private var dx11Card: some View {
+        HStack(spacing: 16) {
+            ZStack {
+                RoundedRectangle(
+                    cornerRadius: 14,
+                    style: .continuous
+                )
+                .fill(Color.green.opacity(0.16))
+
+                Image(systemName: "cube.transparent.fill")
+                    .font(.system(size: 25, weight: .semibold))
+                    .foregroundStyle(.green)
+            }
+            .frame(width: 52, height: 52)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("DX11 / DXMT 验证")
+                    .font(.system(size: 17, weight: .semibold))
+
+                Text("x64 cube → FEX → Wine → DXMT → Metal")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(WinArcTheme.secondary)
+
+                Text(
+                    "使用 Madeira 随 App 打包的 cube-x64.exe，" +
+                    "先确认第一条完整 DX11 图形链。"
+                )
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white.opacity(0.42))
+            }
+
+            Spacer()
+
+            Button(
+                jit.isPreparingRuntime
+                ? "JIT 预检中…"
+                : "启动 DX11 Cube"
+            ) {
+                runtime.applyEnvironment()
+                launchTarget = .dx11Cube
+
+                LogStore.shared.log(
+                    "[WinArc DX11] request x64 cube / DXMT"
+                )
+
+                jit.validateForRuntimeLaunch { passed in
+                    if passed {
+                        showMadeiraRuntime = true
+                    } else {
+                        showLaunchError = true
+                    }
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(
+                jit.isPreparingRuntime ||
+                jit.isRunningFullTest ||
+                jit.isRunningQuickCheck
+            )
+        }
+        .padding(18)
+        .winArcGlass()
+    }
+
     private var desktopCard: some View {
         HStack(spacing: 16) {
             ZStack {
@@ -275,6 +361,7 @@ struct HomeView: View {
                 : "启动桌面"
             ) {
                 runtime.applyEnvironment()
+                launchTarget = .desktop
 
                 jit.validateForRuntimeLaunch { passed in
                     if passed {
