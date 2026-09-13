@@ -8,7 +8,6 @@ enum WinArcJITStatus: String {
     case unavailable
 }
 
-
 enum WinArcJITMode: String, CaseIterable, Identifiable {
     case automatic
     case stable
@@ -19,10 +18,10 @@ enum WinArcJITMode: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .automatic: return "Madeira 原生（推荐）"
-        case .stable: return "Madeira 原生"
-        case .performance: return "Madeira 原生"
-        case .custom: return "Madeira 原生"
+        case .automatic: return "自动（推荐）"
+        case .stable: return "稳定"
+        case .performance: return "性能"
+        case .custom: return "自定义"
         }
     }
 }
@@ -33,7 +32,12 @@ enum WinArcJITStrategy: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    var title: String { "Madeira Stock" }
+    var title: String {
+        switch self {
+        case .localDualMap: return "In-Process Provider"
+        case .debuggerAlloc: return "Madeira BRK（诊断）"
+        }
+    }
 }
 
 extension Notification.Name {
@@ -46,15 +50,14 @@ final class WinArcJITManager: ObservableObject {
 
     @Published private(set) var status: WinArcJITStatus = .checking
     @Published private(set) var debuggerAttached = false
-    @Published private(set) var physicalFootprintMB = 0
-    @Published private(set) var lastMessage = "等待检测"
-
-    // Compatibility surface for older WinArc UI code. These values are
-    // management-only and never alter Madeira's runtime.
     @Published private(set) var dualMappingAvailable = false
     @Published private(set) var executionValidated = false
+    @Published private(set) var physicalFootprintMB = 0
+    @Published private(set) var lastMessage = "等待检测"
     @Published private(set) var recoveredFromFailedLaunch = false
-    @Published private(set) var lastKnownGoodText = "Madeira Stock"
+    @Published private(set) var lastKnownGoodText =
+        "Madeira + In-Process Provider"
+
     @Published var mode: WinArcJITMode = .automatic
     @Published var strategy: WinArcJITStrategy = .localDualMap
     @Published var customPoolMB: Int = 256
@@ -80,10 +83,12 @@ final class WinArcJITManager: ObservableObject {
             ? true
             : UserDefaults.standard.bool(forKey: "WinArcJIT.quickCheck")
 
-        LogStore.shared.log(
-            "[WinArc JIT] management-only mode; Madeira owns JIT runtime"
-        )
         prepareMadeiraStockRuntime()
+
+        LogStore.shared.log(
+            "[WinArc JIT] provider=inprocess; Madeira FEX/Wine/DXMT remain stock"
+        )
+
         updateFootprint()
     }
 
@@ -91,7 +96,7 @@ final class WinArcJITManager: ObservableObject {
         switch status {
         case .checking: return "检测中"
         case .ready: return "已就绪"
-        case .needsValidation: return "等待 Madeira"
+        case .needsValidation: return "待验证"
         case .unavailable: return "不可用"
         }
     }
@@ -102,7 +107,7 @@ final class WinArcJITManager: ObservableObject {
     func runQuickCheckIfNeeded() {
         guard quickCheckOnLaunch else {
             status = .needsValidation
-            lastMessage = "轻量检测已关闭；运行时由 Madeira 原生 JIT 管理"
+            lastMessage = "自动检测已关闭"
             updateFootprint()
             return
         }
@@ -114,34 +119,46 @@ final class WinArcJITManager: ObservableObject {
     func runQuickCheck() {
         guard !isRunningQuickCheck, !isPreparingRuntime else { return }
 
+        prepareMadeiraStockRuntime()
+
         quickCheckHasRun = true
         isRunningQuickCheck = true
         status = .checking
-        lastMessage = "正在检查 Debugger/JIT 状态…"
+        lastMessage = "正在检查设备 JIT 与 Madeira 双映射能力…"
         updateFootprint()
 
         LogStore.shared.log("[WinArc JIT QuickCheck] BEGIN")
 
         DispatchQueue.global(qos: .userInitiated).async {
             let debugged = jit_check_debugged()
+            let mapping = debugged ? jit_test_mapping() : false
 
             LogStore.shared.log(
-                "[WinArc JIT QuickCheck] CS_DEBUGGED=\(debugged)"
+                "[WinArc JIT QuickCheck] CS_DEBUGGED=\(debugged) mapping=\(mapping)"
             )
 
             DispatchQueue.main.async {
                 self.debuggerAttached = debugged
+                self.dualMappingAvailable = mapping
                 self.isRunningQuickCheck = false
                 self.updateFootprint()
 
-                if debugged {
-                    self.status = .ready
-                    self.lastMessage =
-                        "Debugger/JIT 已就绪；执行、Pool 与 detach 交给 Madeira 原生 Runtime"
-                } else {
+                guard debugged else {
                     self.status = .unavailable
-                    self.lastMessage = "未检测到可用 JIT Debugger"
+                    self.lastMessage = "设备当前没有可用 JIT / CS_DEBUGGED"
+                    return
                 }
+
+                guard mapping else {
+                    self.status = .unavailable
+                    self.lastMessage =
+                        "设备 JIT 已存在，但 Madeira RW/RX 双映射检测失败"
+                    return
+                }
+
+                self.status = .ready
+                self.lastMessage =
+                    "设备 JIT + Madeira In-Process Provider 已就绪"
             }
         }
     }
@@ -154,42 +171,52 @@ final class WinArcJITManager: ObservableObject {
             return
         }
 
+        prepareMadeiraStockRuntime()
+
         isPreparingRuntime = true
         status = .checking
-        lastMessage = "正在检查 Madeira 原生 Runtime 启动条件…"
-
-        prepareMadeiraStockRuntime()
+        lastMessage = "正在验证 In-Process JIT Provider…"
         updateFootprint()
 
         LogStore.shared.log(
-            "[WinArc JIT Launch] stock Madeira preflight BEGIN"
+            "[WinArc JIT Launch] in-process provider preflight BEGIN"
         )
 
         DispatchQueue.global(qos: .userInitiated).async {
             let debugged = jit_check_debugged()
+            let mapping = debugged ? jit_test_mapping() : false
 
             LogStore.shared.log(
-                "[WinArc JIT Launch] CS_DEBUGGED=\(debugged)"
+                "[WinArc JIT Launch] CS_DEBUGGED=\(debugged) mapping=\(mapping)"
             )
 
             DispatchQueue.main.async {
                 self.debuggerAttached = debugged
+                self.dualMappingAvailable = mapping
                 self.isPreparingRuntime = false
                 self.updateFootprint()
 
                 guard debugged else {
                     self.status = .unavailable
-                    self.lastMessage = "未检测到可用 JIT Debugger"
+                    self.lastMessage = "未检测到设备 JIT / CS_DEBUGGED"
+                    completion(false)
+                    return
+                }
+
+                guard mapping else {
+                    self.status = .unavailable
+                    self.lastMessage =
+                        "Madeira 双映射 Provider 不可用，已阻止 Runtime 启动"
                     completion(false)
                     return
                 }
 
                 self.status = .ready
                 self.lastMessage =
-                    "检查通过；启动将直接使用 Madeira 原生 JIT/FEX/Wine/DXMT 路径"
+                    "Provider 检查通过；进入 Madeira FEX → Wine → DXMT"
 
                 LogStore.shared.log(
-                    "[WinArc JIT Launch] PASS -> Madeira stock runtime",
+                    "[WinArc JIT Launch] PASS -> in-process provider -> Madeira runtime",
                     level: .success
                 )
 
@@ -199,24 +226,27 @@ final class WinArcJITManager: ObservableObject {
     }
 
     func runFullSelfTest(completion: ((Bool) -> Void)? = nil) {
-        // The old WinArc return-42 execution test is intentionally disabled:
-        // it is not part of the product runtime and previously changed the
-        // behavior we were trying to validate.
-        lastMessage = "高级执行 Self Test 已停用；由 Madeira 原生 Runtime 完成实际 JIT 验证"
+        lastMessage =
+            "高级 BRK Self Test 已停用；不让诊断路径改变产品 Runtime"
         LogStore.shared.log(
-            "[WinArc JIT] custom execution self-test disabled; Madeira owns execution"
+            "[WinArc JIT] debugger BRK self-test disabled in provider mode"
         )
-        completion?(debuggerAttached)
+        completion?(debuggerAttached && dualMappingAvailable)
     }
 
     func applyConfiguration() {
         prepareMadeiraStockRuntime()
-        lastMessage = "WinArc 不覆盖 JIT 配置；Madeira 原生 Runtime 保持生效"
+        lastMessage =
+            "已应用 In-Process Provider；Madeira FEX/Wine/DXMT 未改动"
     }
 
     func restoreLastKnownGood() {
+        mode = .automatic
+        strategy = .localDualMap
+        customPoolMB = 256
         prepareMadeiraStockRuntime()
-        lastMessage = "已恢复 Madeira 原生 Runtime 基线"
+        lastMessage =
+            "已恢复 WinArc Provider + Madeira Runtime 基线"
     }
 
     func prepareMadeiraStockRuntime() {
@@ -224,14 +254,13 @@ final class WinArcJITManager: ObservableObject {
         unsetenv("WINARC_WINE_PE16K")
         unsetenv("WINARC_PE16K_DIRECT_EXEC_BYPASS")
 
+        setenv("WINARC_JIT_PROVIDER", "inprocess", 1)
+
         let docs = FileManager.default.urls(
             for: .documentDirectory,
             in: .userDomainMask
         )[0]
-        // Madeira itself supports Documents/madeira-pool.txt as a runtime
-        // pool-size override. Keep the stock allocator/prepare/detach path,
-        // but use a conservative 256MB pool on this device class instead of
-        // Madeira's 896MB Steam/CEF-oriented default.
+
         let poolOverride = docs.appendingPathComponent("madeira-pool.txt")
         try? "256\n".write(
             to: poolOverride,
@@ -240,7 +269,8 @@ final class WinArcJITManager: ObservableObject {
         )
 
         LogStore.shared.log(
-            "[WinArc Runtime] Madeira stock JIT path; native pool override=256MB"
+            "[WinArc Runtime] provider=inprocess; Madeira pool=256MB; "
+            + "FEX/Wine/DXMT stock"
         )
     }
 

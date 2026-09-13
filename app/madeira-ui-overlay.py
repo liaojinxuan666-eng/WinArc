@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import plistlib
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -20,14 +21,46 @@ content_path = donor / "ContentView.swift"
 app_path = donor / "MadeiraApp.swift"
 plist_path = donor / "Info.plist"
 jit_helper_path = donor / "StikJITHelper.swift"
+jit_allocator_path = donor / "JITAllocator.c"
+provider_patch_path = winarc / "app" / "madeira-jit-provider-patch.py"
 
-for p in (content_path, app_path, plist_path, jit_helper_path, ui, overlay):
+for p in (
+    content_path,
+    app_path,
+    plist_path,
+    jit_helper_path,
+    jit_allocator_path,
+    provider_patch_path,
+    ui,
+    overlay,
+):
     if not p.exists():
         raise SystemExit(f"missing required path: {p}")
 
-# Hard guard: WinArc may wrap Madeira's UI, but must not rewrite the
-# Madeira JIT runtime. This byte-for-byte snapshot is checked again at the end.
+# Route lock: StikJITHelper, FEX, Wine and DXMT stay stock. The only
+# permitted JIT integration change is the provider adapter in JITAllocator.c.
 jit_helper_original = jit_helper_path.read_bytes()
+
+provider = subprocess.run(
+    [sys.executable, str(provider_patch_path), str(madeira)],
+    check=False,
+    capture_output=True,
+    text=True,
+)
+if provider.stdout:
+    print(provider.stdout, end="")
+if provider.stderr:
+    print(provider.stderr, end="", file=sys.stderr)
+if provider.returncode != 0:
+    raise SystemExit(
+        f"WinArc JIT provider patch failed with exit {provider.returncode}"
+    )
+if "WINARC_INPROCESS_JIT_PROVIDER_V1=PASS" not in provider.stdout:
+    raise SystemExit("WinArc JIT provider patch did not report PASS")
+if "WINARC_INPROCESS_JIT_PROVIDER_V1" not in jit_allocator_path.read_text(
+    encoding="utf-8"
+):
+    raise SystemExit("WinArc JIT provider marker missing from JITAllocator.c")
 
 source = content_path.read_text(encoding="utf-8")
 
@@ -238,7 +271,8 @@ assert "WinArc JIT Core v0.3" not in jit_helper_path.read_text(encoding="utf-8")
 assert "WINARC_LOCAL_JIT_POOL" not in jit_helper_path.read_text(encoding="utf-8")
 
 print("WINARC_MADEIRA_UI_OVERLAY=PASS")
-print("WINARC_MADEIRA_JIT_UNTOUCHED=PASS")
+print("WINARC_MADEIRA_STIKJITHELPER_UNTOUCHED=PASS")
+print("WINARC_JIT_PROVIDER=INPROCESS")
 print("WINARC_DX11_STOCK_PATH=PASS")
 print("WINARC_D3DMETAL_PLAN=PRESERVED")
 print("WINARC_WINE_LITE_PLAN=PRESERVED")
