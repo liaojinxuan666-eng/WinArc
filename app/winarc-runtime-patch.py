@@ -4,14 +4,219 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-MARKER = "WINARC_JIT_CORE_V1"
+JIT_MARKER = "WINARC_JIT_CORE_V1"
+WINE_MARKER = "WINARC_PE_SOURCE_PROTECT_V1"
 
-if len(sys.argv) != 2:
-    raise SystemExit("usage: winarc-runtime-patch.py <madeira-checkout>")
+args = sys.argv[1:]
+if len(args) not in (1, 2):
+    raise SystemExit("usage: winarc-runtime-patch.py <madeira-checkout> [--wine-only]")
 
-root = Path(sys.argv[1]).resolve()
+root = Path(args[0]).resolve()
+wine_only = len(args) == 2 and args[1] == "--wine-only"
+if len(args) == 2 and not wine_only:
+    raise SystemExit(f"unknown mode: {args[1]}")
+
+wine_path = root / "build" / "ntdll-unix" / "virtual_ios.c"
+if not wine_path.is_file():
+    raise SystemExit(f"missing Madeira Wine source: {wine_path}")
+
+wine = wine_path.read_text(encoding="utf-8")
+
+if WINE_MARKER not in wine:
+    helper_anchor = '''volatile int ios_in_mach_exc;
+
+static inline int mprotect_exec( void *base, size_t size, int unix_prot )
+'''
+    if helper_anchor not in wine:
+        raise SystemExit("virtual_ios.c mprotect_exec anchor changed")
+
+    helper = r'''volatile int ios_in_mach_exc;
+
+/* ===== WINARC_PE_SOURCE_PROTECT_V1 =====
+ *
+ * Wine tracks PE protection at 4KB granularity, while iOS has 16KB host pages.
+ * One host page can therefore contain both executable bytes and WRITECOPY/data.
+ * PE execution is redirected to Madeira's JIT-pool copy; the original PE VA
+ * stays as the loader/data/identity address space and must not be flattened by
+ * a direct RX/RWX mprotect of the whole 16KB host page.
+ */
+static int winarc_is_sec_image_range( void *base, size_t size )
+{
+    struct file_view *view;
+    if (!size) return 0;
+    view = find_view( base, 1 );
+    return view && (view->protect & SEC_IMAGE);
+}
+
+/* Restore physical source pages from the union of Wine's logical 4KB vprot.
+ * EXEC is intentionally removed from the source mapping; instruction fetches
+ * use the JIT-pool copy.  Mixed code/data host pages therefore become RW, while
+ * pure code host pages become R.
+ */
+static void winarc_restore_pe_source_protection( void *base, size_t size,
+                                                  const char *site )
+{
+    uintptr_t b = (uintptr_t)base;
+    uintptr_t e = b + size;
+    uintptr_t p, end;
+    static unsigned int log_n;
+
+    if (!size || e < b) return;
+
+    p = b & ~(uintptr_t)host_page_mask;
+    end = (e + host_page_mask) & ~(uintptr_t)host_page_mask;
+
+    for (; p < end; p += host_page_size)
+    {
+        BYTE vprot = get_host_page_vprot( (void *)p );
+        int want = get_unix_prot( vprot ) & ~PROT_EXEC;
+        int rc = mprotect( (void *)p, host_page_size, want );
+        kern_return_t kr = KERN_SUCCESS;
+        mach_vm_address_t q = (mach_vm_address_t)p;
+        mach_vm_size_t qsize = 0;
+        vm_region_basic_info_data_64_t info = {0};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        int have_info = 0, satisfied = 0;
+        vm_prot_t need = 0;
+
+        if (want & PROT_READ)  need |= VM_PROT_READ;
+        if (want & PROT_WRITE) need |= VM_PROT_WRITE;
+
+        if (mach_vm_region( mach_task_self(), &q, &qsize, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &count, &obj ) == KERN_SUCCESS &&
+            q <= (mach_vm_address_t)p &&
+            q + qsize > (mach_vm_address_t)p)
+        {
+            have_info = 1;
+            satisfied = (rc == 0) && ((info.protection & need) == need);
+            if (want == PROT_NONE) satisfied = (rc == 0) && !info.protection;
+        }
+
+        if (!satisfied && want != PROT_NONE)
+        {
+            kr = vm_protect( mach_task_self(), (vm_address_t)p,
+                             (vm_size_t)host_page_size, FALSE, need );
+
+            if (kr != KERN_SUCCESS && (need & VM_PROT_WRITE))
+                kr = vm_protect( mach_task_self(), (vm_address_t)p,
+                                 (vm_size_t)host_page_size, FALSE,
+                                 need | VM_PROT_COPY );
+
+            q = (mach_vm_address_t)p;
+            qsize = 0;
+            count = VM_REGION_BASIC_INFO_COUNT_64;
+            obj = MACH_PORT_NULL;
+            if (mach_vm_region( mach_task_self(), &q, &qsize,
+                                VM_REGION_BASIC_INFO_64,
+                                (vm_region_info_t)&info, &count, &obj )
+                == KERN_SUCCESS)
+                have_info = 1;
+        }
+
+        if (!ios_in_mach_exc && log_n < 32)
+        {
+            ++log_n;
+            dprintf( 2,
+                     "[WinArc PE Protect] %s host=%p vprot=0x%x want=%c%c "
+                     "mprotect=%d vmkr=%d actual=%s0x%x max=%s0x%x rev=v1\n",
+                     site ? site : "?",
+                     (void *)p, (unsigned)vprot,
+                     (want & PROT_READ) ? 'r' : '-',
+                     (want & PROT_WRITE) ? 'w' : '-',
+                     rc, (int)kr,
+                     have_info ? "" : "?", have_info ? info.protection : 0,
+                     have_info ? "" : "?", have_info ? info.max_protection : 0 );
+        }
+    }
+}
+
+static inline int mprotect_exec( void *base, size_t size, int unix_prot )
+'''
+    wine = wine.replace(helper_anchor, helper, 1)
+
+    normal_anchor = r'''        /* Try normal mprotect first (works on non-TXM devices). On iOS TXM,
+         * mprotect with PROT_EXEC may *appear* to succeed (return 0) without
+         * actually granting EXEC — pages stay RW only. Verify by querying the
+         * actual page protection via Mach vm_region_64; only return early if
+         * EXEC was truly granted. */
+        if (!mprotect( base, size, unix_prot ))
+        {
+'''
+    normal_repl = r'''        /* WinArc: SEC_IMAGE executable ranges always use the JIT-pool copy.
+         * Do not let direct RX/RWX mprotect touch the original PE mapping:
+         * iOS has 16KB host pages while PE protection is 4KB-granular. */
+        if (winarc_is_sec_image_range( base, size ))
+        {
+            static unsigned int skip_n;
+            if (!ios_in_mach_exc && skip_n++ < 24)
+                dprintf( 2, "[WinArc PE Protect] skip direct EXEC mprotect for SEC_IMAGE "
+                             "%p+0x%lx prot=%c%c%c; routing execution to pool copy\n",
+                         base, (unsigned long)size,
+                         (unix_prot & PROT_READ)  ? 'r' : '-',
+                         (unix_prot & PROT_WRITE) ? 'w' : '-',
+                         (unix_prot & PROT_EXEC)  ? 'x' : '-' );
+        }
+        else if (!mprotect( base, size, unix_prot ))
+        {
+'''
+    if normal_anchor not in wine:
+        raise SystemExit("virtual_ios.c normal EXEC mprotect block changed")
+    wine = wine.replace(normal_anchor, normal_repl, 1)
+
+    existing_anchor = r'''                        ERR("iOS vm_protect RW failed kr=%d at %p+0x%lx (was rwx)\n",
+                            kr, base, (unsigned long)size);
+                    }
+                    mprotect( base, size, PROT_READ );
+                    return 0;
+'''
+    existing_repl = r'''                        ERR("iOS vm_protect RW failed kr=%d at %p+0x%lx (was rwx)\n",
+                            kr, base, (unsigned long)size);
+                    }
+                    winarc_restore_pe_source_protection( base, size, "existing-image" );
+                    return 0;
+'''
+    if existing_anchor not in wine:
+        raise SystemExit("virtual_ios.c existing-image source-protection anchor changed")
+    wine = wine.replace(existing_anchor, existing_repl, 1)
+
+    final_anchor = r'''            /* Leave original code section as read-only */
+            mprotect( base, size, PROT_READ );
+            return 0;
+'''
+    final_repl = r'''            /* WinArc: execution now lives in the pool copy. Restore the
+             * ORIGINAL PE mapping from Wine's logical 4KB page protection union
+             * instead of flattening a mixed 16KB host page to read-only. */
+            winarc_restore_pe_source_protection( base, size, "new-image" );
+            return 0;
+'''
+    if final_anchor not in wine:
+        raise SystemExit("virtual_ios.c final PE source-protection anchor changed")
+    wine = wine.replace(final_anchor, final_repl, 1)
+
+    wine_path.write_text(wine, encoding="utf-8")
+
+wine_check = wine_path.read_text(encoding="utf-8")
+for needle in (
+    WINE_MARKER,
+    "winarc_is_sec_image_range",
+    "winarc_restore_pe_source_protection",
+    "skip direct EXEC mprotect for SEC_IMAGE",
+    'winarc_restore_pe_source_protection( base, size, "new-image" )',
+):
+    if needle not in wine_check:
+        raise SystemExit(f"Wine PE-protect post-check failed: {needle}")
+
+print("WINARC_WINE_PE_SOURCE_PROTECT_V1=PASS")
+
+if wine_only:
+    print("WINARC_VERSION=0.0.1")
+    print("WINARC_WINE_PATCHES=PE_SOURCE_PROTECT_V1")
+    print("WINARC_FEX_PATCHES=NONE")
+    print("WINARC_DXMT_PATCHES=NONE")
+    raise SystemExit(0)
+
 app = root / "app" / "Madeira"
-
 content_path = app / "ContentView.swift"
 helper_path = app / "StikJITHelper.swift"
 alloc_c_path = app / "JITAllocator.c"
@@ -26,27 +231,27 @@ helper = helper_path.read_text(encoding="utf-8")
 alloc_c = alloc_c_path.read_text(encoding="utf-8")
 alloc_h = alloc_h_path.read_text(encoding="utf-8")
 
-if MARKER in helper and MARKER in alloc_c and MARKER in alloc_h and MARKER in content:
-    print("WINARC_JIT_CORE_V1=ALREADY_APPLIED")
-    raise SystemExit(0)
-
-include_anchor = "#include <errno.h>\n"
-if include_anchor not in alloc_c:
-    raise SystemExit("JITAllocator.c include anchor changed")
-alloc_c = alloc_c.replace(
-    include_anchor,
-    include_anchor + "#include <sys/sysctl.h>\n#include <sys/proc.h>\n",
-    1,
+jit_already = (
+    JIT_MARKER in helper and JIT_MARKER in alloc_c
+    and JIT_MARKER in alloc_h and JIT_MARKER in content
 )
 
-trap_anchor = "// SIGTRAP handler: skips BRK instruction (PC += 4) and zeros x0.\n"
-if trap_anchor not in alloc_c:
-    raise SystemExit("JITAllocator.c SIGTRAP anchor changed")
+if not jit_already:
+    include_anchor = "#include <errno.h>\n"
+    if include_anchor not in alloc_c:
+        raise SystemExit("JITAllocator.c include anchor changed")
+    alloc_c = alloc_c.replace(
+        include_anchor,
+        include_anchor + "#include <sys/sysctl.h>\n#include <sys/proc.h>\n",
+        1,
+    )
 
-trace_impl = r'''
+    trap_anchor = "// SIGTRAP handler: skips BRK instruction (PC += 4) and zeros x0.\n"
+    if trap_anchor not in alloc_c:
+        raise SystemExit("JITAllocator.c SIGTRAP anchor changed")
+
+    trace_impl = r'''
 // ===== WINARC_JIT_CORE_V1: capability probe =====
-// CS_DEBUGGED and "currently traced" are intentionally separate.
-// Some JIT methods leave CS_DEBUGGED usable after their debugger has detached.
 bool jit_is_traced(void) {
     struct kinfo_proc info;
     size_t size = sizeof(info);
@@ -60,33 +265,25 @@ bool jit_is_traced(void) {
 }
 
 '''
-alloc_c = alloc_c.replace(trap_anchor, trace_impl + trap_anchor, 1)
+    alloc_c = alloc_c.replace(trap_anchor, trace_impl + trap_anchor, 1)
 
-old_trap_check = '''    if (jit_check_debugged()) {
+    old_trap_check = '''    if (jit_check_debugged()) {
         jit_log("Debugger attached — skipping SIGTRAP handler (debugger handles BRK)");
         return;
     }
 '''
-new_trap_check = '''    if (jit_is_traced()) {
+    new_trap_check = '''    if (jit_is_traced()) {
         jit_log("Debugger currently attached — skipping SIGTRAP handler (debugger handles BRK)");
         return;
     }
 '''
-if old_trap_check not in alloc_c:
-    raise SystemExit("JITAllocator.c trap-install logic changed")
-alloc_c = alloc_c.replace(old_trap_check, new_trap_check, 1)
+    if old_trap_check not in alloc_c:
+        raise SystemExit("JITAllocator.c trap-install logic changed")
+    alloc_c = alloc_c.replace(old_trap_check, new_trap_check, 1)
 
-native_pool_impl = r'''
+    native_pool_impl = r'''
 
 // ===== WINARC_JIT_CORE_V1: native capability-backed pool =====
-// Thin wrapper around Madeira's existing jit_region_create() allocator.
-// No Wine/FEX/DXMT patching and no jit26_* replacement.
-//
-// Madeira's legacy StikDebug path performs one provider-independent placement
-// preparation step before asking the debugger for the pool: reserve low
-// VM_FLAGS_ANYWHERE space until the allocation frontier crosses 0x119000000.
-// FEX's current dispatcher encoding is known to fail below that address.
-// Native-direct must preserve the same placement invariant.
 static JITRegion *g_winarc_native_pool = NULL;
 static vm_address_t g_winarc_pin_chunks[32];
 static int g_winarc_pin_count = 0;
@@ -141,8 +338,6 @@ bool winarc_jit_native_pool_create(size_t size, void **rx_out, void **rw_out) {
     const uintptr_t guest_lo = 0x7000000000ULL;
     const uintptr_t guest_hi = 0x8000000000ULL;
 
-    // Reserve only; never touch the pin pages. Keep them alive for process
-    // lifetime so the kernel cannot immediately recycle the low holes.
     if (!winarc_jit_prepare_low_frontier()) {
         jit_log("[WinArc JIT] native pool aborted: low-VA frontier prep failed");
         *rx_out = NULL;
@@ -178,13 +373,8 @@ bool winarc_jit_native_pool_create(size_t size, void **rx_out, void **rw_out) {
                 attempt + 1, jit_region_rx_ptr(region), size, reason);
         jit_region_destroy(region);
 
-        // Madeira measured that freeing a guest-window mapping and blindly
-        // retrying often returns the identical hole. Stop there rather than
-        // pretending a re-roll is a strategy.
         if (overlaps_guest || overflow) break;
 
-        // ASLR can leave a small gap below 0x119000000 even after the frontier
-        // sweep. Reserve one extra chunk and make one final attempt.
         if (too_low && g_winarc_pin_count < 32) {
             vm_address_t addr = 0;
             const vm_size_t chunk_size = (vm_size_t)(16ULL * 1024ULL * 1024ULL);
@@ -210,15 +400,15 @@ bool winarc_jit_native_pool_active(void) {
     return g_winarc_native_pool != NULL;
 }
 '''
-alloc_c = alloc_c.rstrip() + native_pool_impl + "\n"
+    alloc_c = alloc_c.rstrip() + native_pool_impl + "\n"
 
-header_anchor = '''void jit_set_log_callback(jit_log_callback_t callback);
+    header_anchor = '''void jit_set_log_callback(jit_log_callback_t callback);
 
 #ifdef __cplusplus
 '''
-if header_anchor not in alloc_h:
-    raise SystemExit("JITAllocator.h footer anchor changed")
-header_add = '''void jit_set_log_callback(jit_log_callback_t callback);
+    if header_anchor not in alloc_h:
+        raise SystemExit("JITAllocator.h footer anchor changed")
+    header_add = '''void jit_set_log_callback(jit_log_callback_t callback);
 
 // ===== WINARC_JIT_CORE_V1 =====
 bool jit_is_traced(void);
@@ -227,16 +417,14 @@ bool winarc_jit_native_pool_active(void);
 
 #ifdef __cplusplus
 '''
-alloc_h = alloc_h.replace(header_anchor, header_add, 1)
+    alloc_h = alloc_h.replace(header_anchor, header_add, 1)
 
-if "import Darwin\n" not in helper:
-    helper = helper.replace("import UIKit\n", "import UIKit\nimport Darwin\n", 1)
+    if "import Darwin\n" not in helper:
+        helper = helper.replace("import UIKit\n", "import UIKit\nimport Darwin\n", 1)
 
-jit_core_swift = r'''
+    jit_core_swift = r'''
 
 // ===== WINARC_JIT_CORE_V1 =====
-// Capability-driven JIT selection. Provider names are secondary; actual
-// execution and mapping capabilities decide the route.
 enum WinArcJITBackend: String {
     case nativeDirect = "native-direct"
     case legacyStikDebug = "stikdebug-legacy"
@@ -413,21 +601,21 @@ enum WinArcJITCore {
     }
 }
 '''
-helper = helper.rstrip() + jit_core_swift + "\n"
+    helper = helper.rstrip() + jit_core_swift + "\n"
 
-button_old = '''                Button("Enable JIT") {
+    button_old = '''                Button("Enable JIT") {
                     enableJITViaStikDebug()
                 }
 '''
-button_new = '''                Button("Enable JIT") {
+    button_new = '''                Button("Enable JIT") {
                     enableJITSmart()
                 }
 '''
-if button_old not in content:
-    raise SystemExit("ContentView Enable JIT button changed")
-content = content.replace(button_old, button_new, 1)
+    if button_old not in content:
+        raise SystemExit("ContentView Enable JIT button changed")
+    content = content.replace(button_old, button_new, 1)
 
-smart_func = r'''    // ===== WINARC_JIT_CORE_V1 =====
+    smart_func = r'''    // ===== WINARC_JIT_CORE_V1 =====
     private func enableJITSmart() {
         jitStatus = .testing
         logStore.log("WinArc JIT: probing capabilities...")
@@ -452,61 +640,64 @@ smart_func = r'''    // ===== WINARC_JIT_CORE_V1 =====
     }
 
 '''
-func_anchor = "    private func enableJITViaStikDebug() {\n"
-if func_anchor not in content:
-    raise SystemExit("ContentView enableJITViaStikDebug anchor changed")
-content = content.replace(func_anchor, smart_func + func_anchor, 1)
+    func_anchor = "    private func enableJITViaStikDebug() {\n"
+    if func_anchor not in content:
+        raise SystemExit("ContentView enableJITViaStikDebug anchor changed")
+    content = content.replace(func_anchor, smart_func + func_anchor, 1)
 
-guard_old = '''        guard jit_check_debugged() else {
+    guard_old = '''        guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
             return
         }
 '''
-guard_new = '''        guard WinArcJITCore.canStartRuntime() else {
+    guard_new = '''        guard WinArcJITCore.canStartRuntime() else {
             logStore.log("WinArc JIT is not ready. Press 'Enable JIT' first.", level: .error)
             return
         }
 '''
-if guard_old not in content:
-    raise SystemExit("ContentView runWineFullSequence JIT guard changed")
-content = content.replace(guard_old, guard_new, 1)
+    if guard_old not in content:
+        raise SystemExit("ContentView runWineFullSequence JIT guard changed")
+    content = content.replace(guard_old, guard_new, 1)
 
-pool_old = "let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)"
-pool_new = "let pool = WinArcJITCore.allocatePool(poolSize: poolSizeMB * 1024 * 1024)"
-if pool_old not in content:
-    raise SystemExit("ContentView pool allocation call changed")
-content = content.replace(pool_old, pool_new, 1)
+    pool_old = "let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)"
+    pool_new = "let pool = WinArcJITCore.allocatePool(poolSize: poolSizeMB * 1024 * 1024)"
+    if pool_old not in content:
+        raise SystemExit("ContentView pool allocation call changed")
+    content = content.replace(pool_old, pool_new, 1)
 
-pool_fail_old = '''                logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
+    pool_fail_old = '''                logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
                 logStore.log("  All placements landed in the forbidden guest 64G window.", level: .info)
                 logStore.log("  Force-quit and relaunch: placement is chosen by the kernel", level: .info)
                 logStore.log("  and depends on current memory layout, so a fresh process", level: .info)
                 logStore.log("  usually lands somewhere valid.", level: .info)
 '''
-pool_fail_new = '''                logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
+    pool_fail_new = '''                logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
                 logStore.log("  See [WinArc JIT] lines above for the exact placement reason.", level: .info)
                 logStore.log("  native-direct rejects mode-A-low and guest-window placements.", level: .info)
                 logStore.log("  Do not infer the cause from the final nil alone.", level: .info)
 '''
-if pool_fail_old not in content:
-    raise SystemExit("ContentView pool failure text changed")
-content = content.replace(pool_fail_old, pool_fail_new, 1)
+    if pool_fail_old not in content:
+        raise SystemExit("ContentView pool failure text changed")
+    content = content.replace(pool_fail_old, pool_fail_new, 1)
 
-if "StikJITHelper.detachDebugger()" not in content:
-    raise SystemExit("ContentView detach call not found")
-content = content.replace("StikJITHelper.detachDebugger()", "WinArcJITCore.detachIfNeeded()")
-content += "\n// WINARC_JIT_CORE_V1\n"
+    if "StikJITHelper.detachDebugger()" not in content:
+        raise SystemExit("ContentView detach call not found")
+    content = content.replace(
+        "StikJITHelper.detachDebugger()",
+        "WinArcJITCore.detachIfNeeded()"
+    )
+    content += "\n// WINARC_JIT_CORE_V1\n"
 
-alloc_c_path.write_text(alloc_c, encoding="utf-8")
-alloc_h_path.write_text(alloc_h, encoding="utf-8")
-helper_path.write_text(helper, encoding="utf-8")
-content_path.write_text(content, encoding="utf-8")
+    alloc_c_path.write_text(alloc_c, encoding="utf-8")
+    alloc_h_path.write_text(alloc_h, encoding="utf-8")
+    helper_path.write_text(helper, encoding="utf-8")
+    content_path.write_text(content, encoding="utf-8")
 
 checks = {
-    alloc_c_path: ["WINARC_JIT_CORE_V1", "bool jit_is_traced(void)", "winarc_jit_native_pool_create"],
-    alloc_h_path: ["WINARC_JIT_CORE_V1", "winarc_jit_native_pool_create"],
-    helper_path: ["WINARC_JIT_CORE_V1", "enum WinArcJITCore", "native-direct", "stikdebug-legacy"],
-    content_path: ["WINARC_JIT_CORE_V1", "enableJITSmart()", "WinArcJITCore.allocatePool", "WinArcJITCore.detachIfNeeded"],
+    alloc_c_path: [JIT_MARKER, "bool jit_is_traced(void)", "winarc_jit_native_pool_create"],
+    alloc_h_path: [JIT_MARKER, "winarc_jit_native_pool_create"],
+    helper_path: [JIT_MARKER, "enum WinArcJITCore", "native-direct", "stikdebug-legacy"],
+    content_path: [JIT_MARKER, "enableJITSmart()", "WinArcJITCore.allocatePool", "WinArcJITCore.detachIfNeeded"],
 }
 for path, needles in checks.items():
     text = path.read_text(encoding="utf-8")
@@ -519,6 +710,6 @@ print("WINARC_VERSION=0.0.1")
 print("WINARC_JIT_POLICY=CAPABILITY_DRIVEN")
 print("WINARC_JIT_NATIVE_POOL=MADEIRA_DUALMAP")
 print("WINARC_JIT_STIKDEBUG=FALLBACK_ONLY")
+print("WINARC_WINE_PATCHES=PE_SOURCE_PROTECT_V1")
 print("WINARC_FEX_PATCHES=NONE")
-print("WINARC_WINE_PATCHES=NONE")
 print("WINARC_DXMT_PATCHES=NONE")
