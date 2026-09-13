@@ -67,6 +67,16 @@ launch_hook_new = launch_hook_old + '''            .onReceive(NotificationCenter
 
                 runWineFullSequence()
             }
+            .onReceive(NotificationCenter.default.publisher(for: .winArcLaunchARM64DX11)) { _ in
+                LogStore.shared.log(
+                    "[WinArc DX11 ARM64] calling Madeira runTriangleTest()"
+                )
+
+                // Deliberately use Madeira's own ARM64 DX11 diagnostic path.
+                // This bypasses cube-x64.exe / FEX / ARM64EC so DXMT + Metal
+                // can be validated independently.
+                runTriangleTest()
+            }
 
 '''
 
@@ -419,6 +429,8 @@ assert re.search(
 assert "winarc_graphics_backend_status_text" not in generated
 assert ".winArcLaunchDesktop" in generated
 assert ".winArcLaunchDX11Cube" in generated
+assert ".winArcLaunchARM64DX11" in generated
+assert "[WinArc DX11 ARM64] calling Madeira runTriangleTest()" in generated
 assert "cube-x64.exe" in generated
 assert ".winArcJITPoolReady" in generated
 assert "WinArc JIT Core v0.3" in jit_generated
@@ -427,6 +439,7 @@ assert "SKIPPING debugger prepare" in jit_generated
 
 print("WINARC_MADEIRA_UI_OVERLAY=PASS")
 print("WINARC_DX11_CUBE_BRIDGE=PASS")
+print("WINARC_DX11_ARM64_ISOLATION=PASS")
 print("WINARC_JIT_CORE_V0=PASS")
 print("WINARC_JIT_DIRECT_LOCAL_POOL=PASS")
 print("WINARC_JIT_KEEP_DEBUGGER=PASS")

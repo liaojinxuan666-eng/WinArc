@@ -3,11 +3,15 @@ import SwiftUI
 extension Notification.Name {
     static let winArcLaunchDX11Cube =
         Notification.Name("WinArcLaunchDX11Cube")
+
+    static let winArcLaunchARM64DX11 =
+        Notification.Name("WinArcLaunchARM64DX11")
 }
 
 private enum WinArcRuntimeLaunchTarget {
     case desktop
     case dx11Cube
+    case arm64DX11
 
     var notification: Notification.Name {
         switch self {
@@ -15,6 +19,8 @@ private enum WinArcRuntimeLaunchTarget {
             return .winArcLaunchDesktop
         case .dx11Cube:
             return .winArcLaunchDX11Cube
+        case .arm64DX11:
+            return .winArcLaunchARM64DX11
         }
     }
 }
@@ -277,13 +283,13 @@ struct HomeView: View {
                 Text("DX11 / DXMT 验证")
                     .font(.system(size: 17, weight: .semibold))
 
-                Text("x64 cube → FEX → Wine → DXMT → Metal")
+                Text("ARM64 A/B：Wine → DXMT → Metal；x64：FEX → Wine → DXMT → Metal")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(WinArcTheme.secondary)
 
                 Text(
-                    "使用 Madeira 随 App 打包的 cube-x64.exe，" +
-                    "先确认第一条完整 DX11 图形链。"
+                    "先跑 Madeira 原生 ARM64 triangle，" +
+                    "把 FEX/ARM64EC 与 DXMT/Metal 分开验证。"
                 )
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.white.opacity(0.42))
@@ -291,27 +297,47 @@ struct HomeView: View {
 
             Spacer()
 
-            Button(
-                jit.isPreparingRuntime
-                ? "JIT 预检中…"
-                : "启动 DX11 Cube"
-            ) {
-                runtime.applyEnvironment()
-                launchTarget = .dx11Cube
+            VStack(alignment: .trailing, spacing: 8) {
+                Button(
+                    jit.isPreparingRuntime
+                    ? "JIT 预检中…"
+                    : "ARM64 隔离测试"
+                ) {
+                    runtime.applyEnvironment()
+                    launchTarget = .arm64DX11
 
-                LogStore.shared.log(
-                    "[WinArc DX11] request x64 cube / DXMT"
-                )
+                    LogStore.shared.log(
+                        "[WinArc DX11 ARM64] request Madeira triangle test"
+                    )
 
-                jit.validateForRuntimeLaunch { passed in
-                    if passed {
-                        showMadeiraRuntime = true
-                    } else {
-                        showLaunchError = true
+                    jit.validateForRuntimeLaunch { passed in
+                        if passed {
+                            showMadeiraRuntime = true
+                        } else {
+                            showLaunchError = true
+                        }
                     }
                 }
+                .buttonStyle(.borderedProminent)
+
+                Button("x64 / FEX 再测") {
+                    runtime.applyEnvironment()
+                    launchTarget = .dx11Cube
+
+                    LogStore.shared.log(
+                        "[WinArc DX11 x64] request cube-x64.exe / DXMT"
+                    )
+
+                    jit.validateForRuntimeLaunch { passed in
+                        if passed {
+                            showMadeiraRuntime = true
+                        } else {
+                            showLaunchError = true
+                        }
+                    }
+                }
+                .buttonStyle(.bordered)
             }
-            .buttonStyle(.borderedProminent)
             .disabled(
                 jit.isPreparingRuntime ||
                 jit.isRunningFullTest ||
