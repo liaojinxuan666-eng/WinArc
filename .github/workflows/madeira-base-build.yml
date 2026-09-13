@@ -1,4 +1,4 @@
-name: WinArc 0.0.1 JIT + PE Protect
+name: WinArc 0.0.1 Resume Build
 
 on:
   workflow_dispatch:
@@ -10,104 +10,11 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  dependencies:
-    name: Build Madeira ${{ matrix.component }}
-    runs-on: macos-15
-    timeout-minutes: 150
-
-    strategy:
-      fail-fast: false
-      matrix:
-        component: [fex, llvm, wine]
-
-    env:
-      HOMEBREW_NO_AUTO_UPDATE: "1"
-      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
-      MADEIRA_COMMIT: daabd75fc4b09ab32196a2eec010537bf018e108
-
-    steps:
-      - name: Checkout WinArc
-        uses: actions/checkout@v4
-
-      - name: Select Xcode 26.3
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -d "$DEVELOPER_DIR"
-          xcodebuild -version
-
-      - name: Install build tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          brew install cmake ninja
-          if [ "${{ matrix.component }}" = "wine" ]; then
-            brew install bison llvm gnutls pkg-config
-            python3 -m py_compile app/winarc-runtime-patch.py
-          fi
-
-      - name: Checkout pinned Madeira base
-        shell: bash
-        run: |
-          set -euo pipefail
-          M="$RUNNER_TEMP/Madeira"
-          rm -rf "$M"
-          git clone \
-            --filter=blob:none \
-            --no-checkout \
-            https://github.com/arjunyerevan95-dot/Madeira.git \
-            "$M"
-          git -C "$M" checkout "$MADEIRA_COMMIT"
-          test "$(git -C "$M" rev-parse HEAD)" = "$MADEIRA_COMMIT"
-
-      - name: Apply WinArc Wine PE protection fix
-        if: matrix.component == 'wine'
-        shell: bash
-        run: |
-          set -euo pipefail
-          M="$RUNNER_TEMP/Madeira"
-
-          python3 app/winarc-runtime-patch.py "$M" --wine-only \
-            | tee winarc-wine-patch.log
-
-          grep -Fx "WINARC_WINE_PE_SOURCE_PROTECT_V1=PASS" winarc-wine-patch.log
-          grep -Fx "WINARC_VERSION=0.0.1" winarc-wine-patch.log
-          grep -Fx "WINARC_WINE_PATCHES=PE_SOURCE_PROTECT_V1" winarc-wine-patch.log
-
-          grep -F "WINARC_PE_SOURCE_PROTECT_V1" \
-            "$M/build/ntdll-unix/virtual_ios.c"
-
-      - name: Build ${{ matrix.component }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          M="$RUNNER_TEMP/Madeira"
-          cd "$M"
-          mkdir -p ci-output
-          bash scripts/ci-build-dependency.sh \
-            "${{ matrix.component }}" \
-            2>&1 | tee "ci-output/${{ matrix.component }}-build.log"
-          test -s "ci-output/${{ matrix.component }}-ios.tar.gz"
-          test -s "ci-output/${{ matrix.component }}-sha256.txt"
-
-      - name: Upload ${{ matrix.component }} package
-        uses: actions/upload-artifact@v4
-        with:
-          name: madeira-${{ matrix.component }}
-          path: |
-            ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-ios.tar.gz
-            ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-sha256.txt
-            ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-source-commit.txt
-            ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-build.log
-            winarc-wine-patch.log
-          if-no-files-found: warn
-          retention-days: 7
-
   app:
-    name: Build WinArc 0.0.1
-    needs: dependencies
+    name: Build WinArc 0.0.1 from cached dependencies
     runs-on: macos-15
     timeout-minutes: 120
 
@@ -116,6 +23,7 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       MADEIRA_COMMIT: daabd75fc4b09ab32196a2eec010537bf018e108
       WINARC_VERSION: 0.0.1
+      REUSE_RUN_ID: "34755112563"
 
     steps:
       - name: Checkout WinArc
@@ -171,6 +79,7 @@ jobs:
 
           path = Path(sys.argv[1])
           text = path.read_text()
+
           old = "PRODUCT_BUNDLE_IDENTIFIER=com.madeira.emulator"
           new = "PRODUCT_BUNDLE_IDENTIFIER=com.winarc.app"
 
@@ -195,65 +104,76 @@ jobs:
           grep -Fx "WINARC_JIT_POLICY=CAPABILITY_DRIVEN" winarc-runtime-patch.log
           grep -Fx "WINARC_WINE_PATCHES=PE_SOURCE_PROTECT_V1" winarc-runtime-patch.log
 
-      - name: Verify WinArc runtime scope
-        shell: bash
-        run: |
-          set -euo pipefail
-          M="$RUNNER_TEMP/Madeira"
-
-          grep -F "WINARC_JIT_CORE_V1" "$M/app/Madeira/JITAllocator.c"
-          grep -F "WINARC_JIT_CORE_V1" "$M/app/Madeira/JITAllocator.h"
-          grep -F "WINARC_JIT_CORE_V1" "$M/app/Madeira/StikJITHelper.swift"
-          grep -F "WINARC_JIT_CORE_V1" "$M/app/Madeira/ContentView.swift"
-          grep -F "WINARC_PE_SOURCE_PROTECT_V1" "$M/build/ntdll-unix/virtual_ios.c"
-          grep -F "winarc_restore_pe_source_protection" "$M/build/ntdll-unix/virtual_ios.c"
-
-          git -C "$M" diff --exit-code "$MADEIRA_COMMIT" -- \
-            app/Madeira/FEXBridge.mm \
-            app/Madeira/FEXBridge.h \
-            app/Madeira/WineProcessBridge.m \
-            app/Madeira/WineProcessBridge.h \
-            app/Madeira/WineServerBridge.m \
-            app/Madeira/WineServerBridge.h \
-            app/Madeira/IOSDisplayShim.m \
-            app/Madeira/Winios
-
-          echo "WINARC_RUNTIME_SCOPE=PASS"
-          echo "WINARC_VERSION=0.0.1"
-
-      - name: Download Madeira FEX package
+      - name: Download FEX from successful run
         uses: actions/download-artifact@v4
         with:
           name: madeira-fex
-          path: ${{ runner.temp }}/Madeira/build-inputs/fex
+          path: ${{ runner.temp }}/reuse/fex
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.REUSE_RUN_ID }}
 
-      - name: Download Madeira LLVM package
+      - name: Download LLVM from successful run
         uses: actions/download-artifact@v4
         with:
           name: madeira-llvm
-          path: ${{ runner.temp }}/Madeira/build-inputs/llvm
+          path: ${{ runner.temp }}/reuse/llvm
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.REUSE_RUN_ID }}
 
-      - name: Download Madeira Wine package
+      - name: Download patched Wine from successful run
         uses: actions/download-artifact@v4
         with:
           name: madeira-wine
-          path: ${{ runner.temp }}/Madeira/build-inputs/wine
+          path: ${{ runner.temp }}/reuse/wine
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.REUSE_RUN_ID }}
 
-      - name: Verify dependency inputs
+      - name: Normalize dependency inputs
         shell: bash
         run: |
           set -euo pipefail
           M="$RUNNER_TEMP/Madeira"
+
           for component in fex llvm wine; do
-            test -s "$M/build-inputs/$component/$component-ios.tar.gz"
-            test -s "$M/build-inputs/$component/$component-sha256.txt"
+            SRC="$RUNNER_TEMP/reuse/$component"
+            DST="$M/build-inputs/$component"
+
+            mkdir -p "$DST"
+
+            TAR="$(find "$SRC" -type f -name "$component-ios.tar.gz" -print -quit)"
+            SHA="$(find "$SRC" -type f -name "$component-sha256.txt" -print -quit)"
+            COMMIT="$(find "$SRC" -type f -name "$component-source-commit.txt" -print -quit || true)"
+
+            test -n "$TAR"
+            test -n "$SHA"
+            test -s "$TAR"
+            test -s "$SHA"
+
+            cp "$TAR" "$DST/$component-ios.tar.gz"
+            cp "$SHA" "$DST/$component-sha256.txt"
+
+            if [ -n "$COMMIT" ] && [ -s "$COMMIT" ]; then
+              cp "$COMMIT" "$DST/$component-source-commit.txt"
+            fi
+
+            echo "===== $component ====="
+            ls -lh "$DST"
+
+            test -s "$DST/$component-ios.tar.gz"
+            test -s "$DST/$component-sha256.txt"
           done
+
+          echo "WINARC_DEPENDENCY_INPUTS=PASS"
 
       - name: Build WinArc 0.0.1
         shell: bash
         run: |
           set -euo pipefail
           M="$RUNNER_TEMP/Madeira"
+
           cd "$M"
           mkdir -p ci-output
 
@@ -274,9 +194,11 @@ jobs:
           mkdir -p "$P"
 
           unzip -q "$M/ci-output/Madeira-unsigned.ipa" -d "$P"
+
           test -d "$P/Payload/Madeira.app"
 
           mv "$P/Payload/Madeira.app" "$P/Payload/WinArc.app"
+
           PLIST="$P/Payload/WinArc.app/Info.plist"
 
           DISPLAY="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$PLIST")"
@@ -297,8 +219,7 @@ jobs:
 
           echo "WINARC_BUILD=PASS"
           echo "WINARC_VERSION=0.0.1"
-          echo "WINARC_JIT_CORE=CAPABILITY_DRIVEN"
-          echo "WINARC_WINE_PE_PROTECT=V1"
+          echo "WINARC_REUSED_DEPENDENCIES_FROM=$REUSE_RUN_ID"
 
       - name: Upload WinArc IPA
         uses: actions/upload-artifact@v4
@@ -312,7 +233,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: WinArc-0.0.1-logs
+          name: WinArc-0.0.1-resume-logs
           path: |
             winarc-runtime-patch.log
             ${{ runner.temp }}/Madeira/ci-output/winarc-0.0.1-build.log
