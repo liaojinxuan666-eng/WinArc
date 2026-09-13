@@ -3,15 +3,11 @@ import SwiftUI
 extension Notification.Name {
     static let winArcLaunchDX11Cube =
         Notification.Name("WinArcLaunchDX11Cube")
-
-    static let winArcLaunchARM64DX11 =
-        Notification.Name("WinArcLaunchARM64DX11")
 }
 
 private enum WinArcRuntimeLaunchTarget {
     case desktop
     case dx11Cube
-    case arm64DX11
 
     var notification: Notification.Name {
         switch self {
@@ -19,8 +15,6 @@ private enum WinArcRuntimeLaunchTarget {
             return .winArcLaunchDesktop
         case .dx11Cube:
             return .winArcLaunchDX11Cube
-        case .arm64DX11:
-            return .winArcLaunchARM64DX11
         }
     }
 }
@@ -53,7 +47,6 @@ struct HomeView: View {
         }
         .onAppear {
             jit.runQuickCheckIfNeeded()
-            runtime.applyEnvironment()
         }
         .sheet(isPresented: $showJITSettings) {
             JITSettingsView()
@@ -73,7 +66,8 @@ struct HomeView: View {
             ZStack(alignment: .topLeading) {
                 MadeiraLegacyContentView()
                     .onAppear {
-                        runtime.applyEnvironment()
+                        runtime.applyCompatibilityBaseline()
+                        jit.prepareMadeiraStockRuntime()
 
                         DispatchQueue.main.asyncAfter(
                             deadline: .now() + 0.35
@@ -196,18 +190,7 @@ struct HomeView: View {
                     "Debugger",
                     jit.debuggerAttached ? "OK" : "—"
                 )
-                jitMetric(
-                    "Dual Map",
-                    jit.dualMappingAvailable ? "OK" : "—"
-                )
-                jitMetric(
-                    "Execute",
-                    jit.executionValidated ? "OK" : "未测"
-                )
-                jitMetric(
-                    "Pool",
-                    "\(jit.effectivePoolMB)MB"
-                )
+                jitMetric("Runtime", "Madeira Stock")
                 jitMetric(
                     "Memory",
                     "\(jit.physicalFootprintMB)MB"
@@ -225,15 +208,6 @@ struct HomeView: View {
                 }
                 .buttonStyle(.bordered)
             }
-
-            if jit.recoveredFromFailedLaunch {
-                Label(
-                    "检测到上一轮 JIT 启动中断，已自动应用回退策略。",
-                    systemImage: "arrow.uturn.backward.circle.fill"
-                )
-                .font(.footnote)
-                .foregroundStyle(.orange)
-            }
         }
         .padding(18)
         .winArcGlass()
@@ -246,12 +220,11 @@ struct HomeView: View {
                 .foregroundStyle(.green)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Wine Runtime")
+                Text("Runtime 路线")
                     .font(.headline)
 
                 Text(
-                    "\(runtime.wineProfile.title) · " +
-                    "DXMT 已接入 · D3DMetal Probe 已准备"
+                    "当前：Madeira 原生 DXMT · 下一阶段：D3DMetal · 随后：Wine 轻量化"
                 )
                 .font(.footnote)
                 .foregroundStyle(WinArcTheme.secondary)
@@ -262,7 +235,6 @@ struct HomeView: View {
         .padding(18)
         .winArcGlass()
     }
-
 
     private var dx11Card: some View {
         HStack(spacing: 16) {
@@ -280,16 +252,15 @@ struct HomeView: View {
             .frame(width: 52, height: 52)
 
             VStack(alignment: .leading, spacing: 5) {
-                Text("DX11 / DXMT 验证")
+                Text("Madeira 原生 DX11 验证")
                     .font(.system(size: 17, weight: .semibold))
 
-                Text("ARM64 A/B：Wine → DXMT → Metal；x64：FEX → Wine → DXMT → Metal")
+                Text("FEX → Wine → DXMT → Metal")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(WinArcTheme.secondary)
 
                 Text(
-                    "先跑 Madeira 原生 ARM64 triangle，" +
-                    "把 FEX/ARM64EC 与 DXMT/Metal 分开验证。"
+                    "不改 JIT、不改 Wine、不改 FEX；直接调用 Madeira 已有 cube-x64.exe 路径。"
                 )
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.white.opacity(0.42))
@@ -297,50 +268,28 @@ struct HomeView: View {
 
             Spacer()
 
-            VStack(alignment: .trailing, spacing: 8) {
-                Button(
-                    jit.isPreparingRuntime
-                    ? "JIT 预检中…"
-                    : "ARM64 隔离测试"
-                ) {
-                    runtime.applyEnvironment()
-                    launchTarget = .arm64DX11
+            Button(
+                jit.isPreparingRuntime
+                ? "启动检查中…"
+                : "运行原生 DX11"
+            ) {
+                launchTarget = .dx11Cube
 
-                    LogStore.shared.log(
-                        "[WinArc DX11 ARM64] request Madeira triangle test"
-                    )
+                LogStore.shared.log(
+                    "[WinArc DX11] request Madeira stock cube-x64.exe path"
+                )
 
-                    jit.validateForRuntimeLaunch { passed in
-                        if passed {
-                            showMadeiraRuntime = true
-                        } else {
-                            showLaunchError = true
-                        }
+                jit.validateForRuntimeLaunch { passed in
+                    if passed {
+                        showMadeiraRuntime = true
+                    } else {
+                        showLaunchError = true
                     }
                 }
-                .buttonStyle(.borderedProminent)
-
-                Button("x64 / FEX 再测") {
-                    runtime.applyEnvironment()
-                    launchTarget = .dx11Cube
-
-                    LogStore.shared.log(
-                        "[WinArc DX11 x64] request cube-x64.exe / DXMT"
-                    )
-
-                    jit.validateForRuntimeLaunch { passed in
-                        if passed {
-                            showMadeiraRuntime = true
-                        } else {
-                            showLaunchError = true
-                        }
-                    }
-                }
-                .buttonStyle(.bordered)
             }
+            .buttonStyle(.borderedProminent)
             .disabled(
                 jit.isPreparingRuntime ||
-                jit.isRunningFullTest ||
                 jit.isRunningQuickCheck
             )
         }
@@ -364,29 +313,25 @@ struct HomeView: View {
             .frame(width: 52, height: 52)
 
             VStack(alignment: .leading, spacing: 5) {
-                Text("Windows 桌面测试")
+                Text("Windows 桌面基线")
                     .font(.system(size: 17, weight: .semibold))
 
-                Text("WinArc JIT → Madeira Runtime → Wine Desktop")
+                Text("Madeira 原生 JIT → FEX → Wine Desktop")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(WinArcTheme.secondary)
 
-                Text(
-                    "当前 Wine Profile：" +
-                    runtime.wineProfile.title
-                )
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.white.opacity(0.42))
+                Text("用于确认 Runtime 基线没有被 WinArc 改写。")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.42))
             }
 
             Spacer()
 
             Button(
                 jit.isPreparingRuntime
-                ? "JIT 预检中…"
+                ? "启动检查中…"
                 : "启动桌面"
             ) {
-                runtime.applyEnvironment()
                 launchTarget = .desktop
 
                 jit.validateForRuntimeLaunch { passed in
@@ -400,7 +345,6 @@ struct HomeView: View {
             .buttonStyle(.borderedProminent)
             .disabled(
                 jit.isPreparingRuntime ||
-                jit.isRunningFullTest ||
                 jit.isRunningQuickCheck
             )
         }

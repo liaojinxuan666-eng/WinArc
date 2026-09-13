@@ -3,17 +3,14 @@ import SwiftUI
 struct JITSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var jit = WinArcJITManager.shared
-    @State private var showSelfTestWarning = false
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     statusCard
-                    modeCard
-                    advancedCard
+                    ownershipCard
                     diagnosticsCard
-                    recoveryCard
                 }
                 .padding(20)
             }
@@ -26,20 +23,6 @@ struct JITSettingsView: View {
             }
         }
         .preferredColorScheme(.dark)
-        .alert(
-            "运行高级 Self Test？",
-            isPresented: $showSelfTestWarning
-        ) {
-            Button("取消", role: .cancel) {}
-            Button("继续运行", role: .destructive) {
-                jit.runFullSelfTest()
-            }
-        } message: {
-            Text(
-                "该测试会实际执行生成的 ARM64 代码并进入 Debugger BRK 路径。" +
-                "它不是正常启动所必需的；当前用于定位 JIT 问题，失败时可能导致 App 退出。"
-            )
-        }
     }
 
     private var statusCard: some View {
@@ -69,117 +52,33 @@ struct JITSettingsView: View {
                 }
                 .buttonStyle(.bordered)
 
-                Button(
-                    jit.isRunningFullTest ? "检测中…" : "高级 Self Test"
-                ) {
-                    showSelfTestWarning = true
-                }
-                .buttonStyle(.bordered)
-                .disabled(
-                    jit.isRunningFullTest ||
-                    jit.isRunningQuickCheck ||
-                    jit.isPreparingRuntime
+                Toggle(
+                    "启动时检测",
+                    isOn: $jit.quickCheckOnLaunch
                 )
+                .toggleStyle(.switch)
             }
+        }
+        .padding(20)
+        .winArcGlass()
+    }
 
-            Label(
-                "正常启动不再执行 Self Test；Runtime Pool 建立结果才是主要验证。",
-                systemImage: "info.circle"
+    private var ownershipCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Runtime 所有权")
+                .font(.headline)
+
+            diagnosticRow("JIT / Pool", "Madeira 原生")
+            diagnosticRow("Debugger prepare", "Madeira 原生")
+            diagnosticRow("Debugger detach", "Madeira 原生")
+            diagnosticRow("PE 页权限", "Madeira/Wine 原生")
+            diagnosticRow("FEX", "Madeira 原生")
+
+            Text(
+                "WinArc 这里只检测状态和提供管理入口，不再覆盖 Madeira 的 JIT、Pool、页权限或 FEX 执行逻辑。"
             )
             .font(.footnote)
             .foregroundStyle(WinArcTheme.secondary)
-        }
-        .padding(20)
-        .winArcGlass()
-    }
-
-    private var modeCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("模式")
-                .font(.headline)
-
-            Picker("JIT 模式", selection: $jit.mode) {
-                ForEach(WinArcJITMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-
-            Toggle(
-                "进入 WinArc 时进行轻量 JIT 检测",
-                isOn: $jit.quickCheckOnLaunch
-            )
-
-            HStack {
-                Text("当前有效配置")
-                    .foregroundStyle(WinArcTheme.secondary)
-                Spacer()
-                Text(
-                    "\(jit.effectiveStrategy.title) · " +
-                    "\(jit.effectivePoolMB)MB"
-                )
-                .font(.system(.footnote, design: .monospaced))
-            }
-        }
-        .padding(20)
-        .winArcGlass()
-    }
-
-    private var advancedCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("高级设置")
-                .font(.headline)
-
-            Picker("JIT 策略", selection: $jit.strategy) {
-                ForEach(WinArcJITStrategy.allCases) { strategy in
-                    Text(strategy.title).tag(strategy)
-                }
-            }
-            .disabled(jit.mode != .custom)
-
-            if jit.mode == .custom {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("JIT Pool")
-                        Spacer()
-                        Text("\(jit.customPoolMB) MB")
-                            .font(.system(.body, design: .monospaced))
-                    }
-
-                    Slider(
-                        value: Binding(
-                            get: { Double(jit.customPoolMB) },
-                            set: {
-                                let stepped = Int(($0 / 64).rounded()) * 64
-                                jit.customPoolMB = stepped
-                            }
-                        ),
-                        in: 256...768,
-                        step: 64
-                    )
-                }
-            }
-
-            if jit.effectiveStrategy == .debuggerAlloc {
-                Label(
-                    "当前设备曾在 Debugger 大块分配路径发生启动中断；仅用于调试。",
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-                .font(.footnote)
-                .foregroundStyle(.orange)
-            } else {
-                Label(
-                    "默认使用本地 RW/RX 双映射，再让 Debugger 只准备 RX。",
-                    systemImage: "checkmark.shield.fill"
-                )
-                .font(.footnote)
-                .foregroundStyle(.green)
-            }
-
-            Button("立即应用") {
-                jit.applyConfiguration()
-            }
-            .buttonStyle(.bordered)
         }
         .padding(20)
         .winArcGlass()
@@ -195,59 +94,29 @@ struct JITSettingsView: View {
                 jit.debuggerAttached ? "已连接" : "未连接"
             )
             diagnosticRow(
-                "RW/RX Dual Map",
-                jit.dualMappingAvailable ? "通过" : "未验证"
-            )
-            diagnosticRow(
-                "Execution",
-                jit.executionValidated ? "通过" : "未测试"
-            )
-            diagnosticRow(
                 "Physical Footprint",
                 "\(jit.physicalFootprintMB) MB"
             )
             diagnosticRow(
-                "Configured Pool",
-                "\(jit.effectivePoolMB) MB"
-            )
-            diagnosticRow(
-                "Last Known Good",
-                jit.lastKnownGoodText
+                "Runtime Path",
+                "Madeira → FEX → Wine → DXMT"
             )
         }
         .padding(20)
         .winArcGlass()
     }
 
-    private var recoveryCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("稳定性与恢复")
-                .font(.headline)
-
-            Text(
-                "WinArc 会在运行时 Pool 成功建立后保存稳定配置；" +
-                "如果下一次启动发现上一轮在 JIT 建立阶段中断，" +
-                "会自动回退。"
-            )
-            .font(.footnote)
-            .foregroundStyle(WinArcTheme.secondary)
-
-            Button("恢复上一次稳定配置") {
-                jit.restoreLastKnownGood()
-            }
-            .buttonStyle(.bordered)
-        }
-        .padding(20)
-        .winArcGlass()
-    }
-
-    private func diagnosticRow(_ name: String, _ value: String) -> some View {
+    private func diagnosticRow(
+        _ name: String,
+        _ value: String
+    ) -> some View {
         HStack {
             Text(name)
                 .foregroundStyle(WinArcTheme.secondary)
             Spacer()
             Text(value)
                 .font(.system(.footnote, design: .monospaced))
+                .multilineTextAlignment(.trailing)
         }
     }
 

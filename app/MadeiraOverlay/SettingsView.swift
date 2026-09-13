@@ -43,7 +43,7 @@ struct SettingsView: View {
                 jitCard
                 runtimeCard
 
-                Text("WinArc 0.0.1 · Madeira base integration")
+                Text("WinArc 0.0.1 · Madeira stock runtime baseline")
                     .font(.footnote.weight(.medium))
                     .foregroundStyle(.white.opacity(0.35))
             }
@@ -52,7 +52,6 @@ struct SettingsView: View {
         }
         .onAppear {
             jit.runQuickCheckIfNeeded()
-            runtime.applyEnvironment()
             refreshGraphics()
         }
         .sheet(isPresented: $showJITSettings) {
@@ -98,7 +97,7 @@ struct SettingsView: View {
 
                 Spacer()
 
-                Text("当前默认")
+                Text("当前阶段")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.green)
             }
@@ -112,17 +111,9 @@ struct SettingsView: View {
 
                     Spacer()
 
-                    Text(
-                        d3dMetalStatus.contains("可加载")
-                        ? "Probe PASS"
-                        : "实验"
-                    )
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(
-                        d3dMetalStatus.contains("可加载")
-                        ? .green
-                        : .orange
-                    )
+                    Text("下一阶段")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.orange)
                 }
 
                 Text(d3dMetalStatus)
@@ -130,8 +121,7 @@ struct SettingsView: View {
                     .foregroundStyle(WinArcTheme.secondary)
 
                 Text(
-                    "WinArc 这里只探测已随 App 签名打包的 D3DMetal 组件；" +
-                    "不会伪装成“已支持”。真正切换到 D3DMetal 要等运行链接通。"
+                    "D3DMetal 计划保留。先让 Madeira 原生 DXMT/DX11 基线稳定，再接入运行链，不提前替换当前图形地基。"
                 )
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.38))
@@ -152,9 +142,9 @@ struct SettingsView: View {
 
                 Spacer()
 
-                Text(runtime.wineProfile.title)
+                Text("计划保留")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.green)
+                    .foregroundStyle(.orange)
             }
 
             Picker(
@@ -166,25 +156,13 @@ struct SettingsView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .onChange(of: runtime.wineProfile) { _, _ in
-                runtime.applyEnvironment()
-            }
 
             Text(runtime.wineProfile.detail)
                 .font(.footnote)
                 .foregroundStyle(WinArcTheme.secondary)
 
-            VStack(alignment: .leading, spacing: 6) {
-                runtimeRow("WINEDEBUG", runtime.environmentValue("WINEDEBUG"))
-                runtimeRow(
-                    "WINEDLLOVERRIDES",
-                    runtime.environmentValue("WINEDLLOVERRIDES")
-                )
-            }
-
             Text(
-                "默认使用“平衡”：先减少日志和 winemenubuilder 后台开销，" +
-                "不碰 Wine 核心 DLL。真正删组件的 build-lite 等 DX11 回归测试稳定后再开。"
+                "当前 DX11 基线阶段固定使用兼容环境，不向 Wine 注入轻量化变量。等 DXMT 回归稳定后，再按“平衡 → 轻量”的顺序启用。"
             )
             .font(.caption)
             .foregroundStyle(.white.opacity(0.38))
@@ -210,15 +188,14 @@ struct SettingsView: View {
             }
 
             Text(
-                "\(jit.effectiveStrategy.title) · " +
-                "\(jit.effectivePoolMB)MB · " +
+                "Madeira 原生 Runtime · " +
                 "\(jit.physicalFootprintMB)MB footprint"
             )
             .font(.footnote)
             .foregroundStyle(WinArcTheme.secondary)
 
             HStack(spacing: 10) {
-                Button("JIT 设置") {
+                Button("JIT 状态") {
                     showJITSettings = true
                 }
                 .buttonStyle(.borderedProminent)
@@ -244,39 +221,24 @@ struct SettingsView: View {
 
                 Spacer()
 
-                Text("调试入口")
+                Text("地基")
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(WinArcTheme.secondary)
+                    .foregroundStyle(.green)
             }
 
             Text(
-                "Madeira 原运行控制台暂时保留作为底层诊断入口；" +
-                "普通启动逐步迁移到 WinArc 自己的 Runtime/JIT 管理。"
+                "Madeira 继续负责 JIT、FEX、Wine、DXMT 和实际启动链；WinArc 只做产品 UI、容器、游戏库、配置与后续增强。"
             )
             .font(.footnote)
             .foregroundStyle(WinArcTheme.secondary)
 
-            Button("打开运行控制") {
+            Button("打开 Madeira 运行控制") {
                 showMadeiraRuntime = true
             }
             .buttonStyle(.bordered)
         }
         .padding(22)
         .winArcGlass()
-    }
-
-    private func runtimeRow(
-        _ name: String,
-        _ value: String
-    ) -> some View {
-        HStack(alignment: .top) {
-            Text(name)
-                .foregroundStyle(WinArcTheme.secondary)
-            Spacer()
-            Text(value)
-                .font(.system(.caption, design: .monospaced))
-                .multilineTextAlignment(.trailing)
-        }
     }
 
     private func refreshGraphics() {
@@ -306,7 +268,7 @@ enum WinArcWineProfile: String, CaseIterable, Identifiable {
         case .compatibility:
             return "兼容优先"
         case .balanced:
-            return "平衡（推荐）"
+            return "平衡"
         case .lite:
             return "轻量"
         }
@@ -315,11 +277,11 @@ enum WinArcWineProfile: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .compatibility:
-            return "保持 Madeira/Wine 原始环境，适合排查兼容性。"
+            return "保持 Madeira/Wine 原始环境，当前 DX11 基线固定使用。"
         case .balanced:
-            return "关闭 Wine 调试噪声，并禁用 winemenubuilder。"
+            return "计划：减少日志和 winemenubuilder 后台开销。"
         case .lite:
-            return "再禁用 Gecko/Mono 自动入口；资源更省，但少数启动器可能需要切回。"
+            return "计划：进一步减少 Gecko/Mono 自动入口与非必要后台开销。"
         }
     }
 }
@@ -342,13 +304,36 @@ final class WinArcRuntimeTuning: ObservableObject {
             rawValue: UserDefaults.standard.string(
                 forKey: "WinArcRuntime.wineProfile"
             ) ?? ""
-        ) ?? .balanced
+        ) ?? .compatibility
     }
 
-    func applyEnvironment() {
+    func applyCompatibilityBaseline() {
         unsetenv("WINEDEBUG")
         unsetenv("WINEDLLOVERRIDES")
         unsetenv("WINARC_WINE_LITE")
+
+        LogStore.shared.log(
+            "[WinArc Wine] compatibility baseline active; no lightweight override"
+        )
+    }
+
+    // Compatibility alias for older WinArc call sites. During the current
+    // DX11 baseline stage this always means "restore stock Wine environment".
+    func applyEnvironment() {
+        applyCompatibilityBaseline()
+    }
+
+    func environmentValue(_ name: String) -> String {
+        guard let value = getenv(name) else {
+            return "<unset>"
+        }
+        return String(cString: value)
+    }
+
+    // Reserved for the later Wine-lightweighting stage.
+    // Do not call this from the current DX11 baseline launch path.
+    func applyPlannedProfile() {
+        applyCompatibilityBaseline()
 
         switch wineProfile {
         case .compatibility:
@@ -374,17 +359,8 @@ final class WinArcRuntimeTuning: ObservableObject {
         }
 
         LogStore.shared.log(
-            "[WinArc Wine] profile=\(wineProfile.rawValue) " +
-            "WINEDEBUG=\(environmentValue("WINEDEBUG")) " +
-            "WINEDLLOVERRIDES=\(environmentValue("WINEDLLOVERRIDES"))"
+            "[WinArc Wine] planned profile applied manually: \(wineProfile.rawValue)"
         )
-    }
-
-    func environmentValue(_ name: String) -> String {
-        guard let value = getenv(name) else {
-            return "<unset>"
-        }
-        return String(cString: value)
     }
 }
 

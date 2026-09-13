@@ -25,6 +25,10 @@ for p in (content_path, app_path, plist_path, jit_helper_path, ui, overlay):
     if not p.exists():
         raise SystemExit(f"missing required path: {p}")
 
+# Hard guard: WinArc may wrap Madeira's UI, but must not rewrite the
+# Madeira JIT runtime. This byte-for-byte snapshot is checked again at the end.
+jit_helper_original = jit_helper_path.read_bytes()
+
 source = content_path.read_text(encoding="utf-8")
 
 if "struct MadeiraLegacyContentView: View {" not in source:
@@ -32,14 +36,14 @@ if "struct MadeiraLegacyContentView: View {" not in source:
         raise SystemExit("Madeira ContentView declaration not found")
     source = re.sub(r"\bContentView\b", "MadeiraLegacyContentView", source)
 
-launch_hook_old = '''            .onAppear {
+launch_hook_old = """            .onAppear {
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
             }
-'''
+"""
 
-launch_hook_new = launch_hook_old + '''            .onReceive(NotificationCenter.default.publisher(for: .winArcLaunchDesktop)) { _ in
+launch_hook_new = launch_hook_old + """            .onReceive(NotificationCenter.default.publisher(for: .winArcLaunchDesktop)) { _ in
                 let deskW = 960
                 let deskH = 540
 
@@ -54,9 +58,10 @@ launch_hook_new = launch_hook_old + '''            .onReceive(NotificationCenter
                 setenv("MADEIRA_SCREEN_H", String(deskH), 1)
 
                 runWineFullSequence()
-            }            .onReceive(NotificationCenter.default.publisher(for: .winArcLaunchDX11Cube)) { _ in
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .winArcLaunchDX11Cube)) { _ in
                 LogStore.shared.log(
-                    "[WinArc DX11] launching bundled cube-x64.exe via DXMT"
+                    "[WinArc DX11] Madeira stock cube-x64.exe path"
                 )
 
                 setenv("MADEIRA_EXE", "cube-x64.exe", 1)
@@ -67,217 +72,13 @@ launch_hook_new = launch_hook_old + '''            .onReceive(NotificationCenter
 
                 runWineFullSequence()
             }
-            .onReceive(NotificationCenter.default.publisher(for: .winArcLaunchARM64DX11)) { _ in
-                LogStore.shared.log(
-                    "[WinArc DX11 ARM64] calling Madeira runTriangleTest()"
-                )
 
-                // Deliberately use Madeira's own ARM64 DX11 diagnostic path.
-                // This bypasses cube-x64.exe / FEX / ARM64EC so DXMT + Metal
-                // can be validated independently.
-                runTriangleTest()
-            }
-
-'''
+"""
 
 if ".winArcLaunchDesktop" not in source:
     if launch_hook_old not in source:
         raise SystemExit("Madeira runtime onAppear hook changed")
     source = source.replace(launch_hook_old, launch_hook_new, 1)
-
-jit_source = jit_helper_path.read_text(encoding="utf-8")
-
-jit_anchor = "        // Ask debugger to allocate RX pages (x0=0 triggers _M allocation).\n"
-
-jit_block = '''        // WinArc JIT Core v0.3: direct local dual-map pool.
-        //
-        // Hardware result from v0.2:
-        //   - 256MB RW/RX dual mapping succeeds
-        //   - the very first debugger prepare of an EXISTING RX mapping
-        //     kills the process, even when reduced to a 16MB chunk
-        //
-        // Therefore the Local Dual Map strategy must not call
-        // jit26_prepare_region() at all. CS_DEBUGGED is already SET and
-        // jit_test_mapping() has verified a coherent RX mapping with execute
-        // protection. This experiment tests whether FEX can execute directly
-        // from that locally-created RX alias.
-        if ProcessInfo.processInfo.environment["WINARC_LOCAL_JIT_POOL"] == "1" {
-            LogStore.shared.log(
-                "WinArc JIT pool: local dual-map DIRECT path enabled"
-            )
-
-            guard jit_check_debugged() else {
-                LogStore.shared.log(
-                    "WinArc local direct pool: CS_DEBUGGED not set",
-                    level: .error
-                )
-                return nil
-            }
-
-            guard let region = jit_region_create(poolSize) else {
-                LogStore.shared.log(
-                    "WinArc local direct pool: jit_region_create failed",
-                    level: .error
-                )
-                return nil
-            }
-
-            guard let rxPtr = jit_region_rx_ptr(region),
-                  let rwPtr = jit_region_rw_ptr(region) else {
-                LogStore.shared.log(
-                    "WinArc local direct pool: missing RW/RX mapping",
-                    level: .error
-                )
-                jit_region_destroy(region)
-                return nil
-            }
-
-            let localRX = Int(bitPattern: rxPtr)
-            let localRW = Int(bitPattern: rwPtr)
-            let localGoodLow = 0x119000000
-            let localGuestLo = 0x7000000000
-            let localGuestHi = 0x8000000000
-            let localInGuestWindow =
-                localRX + poolSize > localGuestLo &&
-                localRX < localGuestHi
-
-            guard localRX >= localGoodLow &&
-                  !localInGuestWindow else {
-                LogStore.shared.log(
-                    String(
-                        format:
-                            "WinArc local direct pool BAD placement " +
-                            "RW=0x%lx RX=0x%lx",
-                        localRW,
-                        localRX
-                    ),
-                    level: .error
-                )
-                jit_region_destroy(region)
-                return nil
-            }
-
-            LogStore.shared.log(
-                String(
-                    format:
-                        "WinArc local direct pool mapped " +
-                        "RW=0x%lx RX=0x%lx size=%dMB",
-                    localRW,
-                    localRX,
-                    poolSize / 1024 / 1024
-                )
-            )
-
-            LogStore.shared.log(
-                "WinArc local direct pool: SKIPPING debugger prepare " +
-                "(existing-RX prepare crashes on this device)"
-            )
-
-            NotificationCenter.default.post(
-                name: .winArcJITPoolReady,
-                object: nil
-            )
-
-            LogStore.shared.log(
-                "WinArc local direct pool: READY -> returning to Madeira/FEX",
-                level: .success
-            )
-
-            // Process-lifetime retention. The JITRegion owns both aliases.
-            return (
-                rx: rxPtr,
-                rw: rwPtr,
-                size: poolSize
-            )
-        }
-
-'''
-
-if "WinArc JIT pool: local dual-map path enabled" not in jit_source:
-    if jit_anchor not in jit_source:
-        raise SystemExit("Madeira StikJITHelper pool anchor changed")
-    jit_source = jit_source.replace(jit_anchor, jit_block + jit_anchor, 1)
-else:
-    block_start = jit_source.find(
-        '        // WinArc JIT Core v0: local dual-map production pool.'
-    )
-    if block_start < 0:
-        block_start = jit_source.find(
-            '        // WinArc JIT Core v0.3: direct local dual-map pool.'
-        )
-
-    stock_pos = jit_source.find(jit_anchor)
-
-    if block_start >= 0 and stock_pos > block_start:
-        jit_source = (
-            jit_source[:block_start]
-            + jit_block
-            + jit_source[stock_pos:]
-        )
-    else:
-        raise SystemExit("existing WinArc JIT pool block shape changed")
-
-stock_ready = '''        LogStore.shared.log("JIT pool ready (debugger still attached).", level: .success)
-
-        return (rx: rxPtr, rw: rwPtr, size: poolSize)
-'''
-
-stock_ready_patched = '''        LogStore.shared.log("JIT pool ready (debugger still attached).", level: .success)
-
-        NotificationCenter.default.post(
-            name: .winArcJITPoolReady,
-            object: nil
-        )
-
-        return (rx: rxPtr, rw: rwPtr, size: poolSize)
-'''
-
-if stock_ready in jit_source:
-    jit_source = jit_source.replace(stock_ready, stock_ready_patched, 1)
-
-
-# WinArc JIT Core v0.4:
-# On this device the local pool now reaches READY, but the process disappears
-# inside jit26_detach() before "Debugger detached." can be logged.
-#
-# Keep StikDebug attached for the Local Dual Map path so Wine/FEX can continue
-# and so later BRK-based PE page preparation remains available. The stock
-# Madeira detach behavior is preserved for every non-WinArc-local strategy.
-detach_old = '''    static func detachDebugger() {
-        LogStore.shared.log("Detaching debugger...")
-        jit26_detach()
-        // task #34: signal in-process waiters (share-probe poller). CS_DEBUGGED
-        // is sticky post-detach, so an env flag is the reliable signal.
-        setenv("MADEIRA_DETACHED", "1", 1)
-        LogStore.shared.log("Debugger detached.", level: .success)
-    }
-'''
-
-detach_new = '''    static func detachDebugger() {
-        if ProcessInfo.processInfo.environment["WINARC_LOCAL_JIT_POOL"] == "1" {
-            LogStore.shared.log(
-                "WinArc JIT: KEEPING debugger attached " +
-                "(jit26_detach crashes on current device)"
-            )
-            unsetenv("MADEIRA_DETACHED")
-            return
-        }
-
-        LogStore.shared.log("Detaching debugger...")
-        jit26_detach()
-        // task #34: signal in-process waiters (share-probe poller). CS_DEBUGGED
-        // is sticky post-detach, so an env flag is the reliable signal.
-        setenv("MADEIRA_DETACHED", "1", 1)
-        LogStore.shared.log("Debugger detached.", level: .success)
-    }
-'''
-
-if 'WinArc JIT: KEEPING debugger attached' not in jit_source:
-    if detach_old not in jit_source:
-        raise SystemExit("Madeira StikJITHelper detachDebugger() shape changed")
-    jit_source = jit_source.replace(detach_old, detach_new, 1)
-
-jit_helper_path.write_text(jit_source, encoding="utf-8")
 
 ui_files = [
     ui / "Theme.swift",
@@ -295,7 +96,7 @@ ui_files = [
     overlay / "SettingsView.swift",
 ]
 
-old_graphics_status_method = '''    private func refreshGraphicsStatus() {
+old_graphics_status_method = """    private func refreshGraphicsStatus() {
         let backend = draft.settings.backend.rawValue
         let bundlePath = Bundle.main.bundlePath
 
@@ -311,17 +112,17 @@ old_graphics_status_method = '''    private func refreshGraphicsStatus() {
             }
         }
     }
-'''
+"""
 
-new_graphics_status_method = '''    private func refreshGraphicsStatus() {
+new_graphics_status_method = """    private func refreshGraphicsStatus() {
         switch draft.settings.backend {
         case .dxmt:
             graphicsStatus = "Madeira DXMT 已就绪"
         case .d3dmetal:
-            graphicsStatus = "D3DMetal 尚未接入 Madeira 地基"
+            graphicsStatus = "D3DMetal 计划保留，等待 DXMT 基线稳定后接入"
         }
     }
-'''
+"""
 
 chunks: list[str] = []
 
@@ -377,7 +178,7 @@ source = (
 content_path.write_text(source, encoding="utf-8")
 
 app_path.write_text(
-    '''import SwiftUI
+    """import SwiftUI
 
 @main
 struct MadeiraApp: App {
@@ -391,7 +192,7 @@ struct MadeiraApp: App {
         }
     }
 }
-''',
+""",
     encoding="utf-8",
 )
 
@@ -412,7 +213,6 @@ with plist_path.open("wb") as f:
 
 generated = content_path.read_text(encoding="utf-8")
 main = app_path.read_text(encoding="utf-8")
-jit_generated = jit_helper_path.read_text(encoding="utf-8")
 
 assert "struct MadeiraLegacyContentView: View" in generated
 assert "struct RootView: View" in generated
@@ -429,22 +229,18 @@ assert re.search(
 assert "winarc_graphics_backend_status_text" not in generated
 assert ".winArcLaunchDesktop" in generated
 assert ".winArcLaunchDX11Cube" in generated
-assert ".winArcLaunchARM64DX11" in generated
-assert "[WinArc DX11 ARM64] calling Madeira runTriangleTest()" in generated
 assert "cube-x64.exe" in generated
-assert ".winArcJITPoolReady" in generated
-assert "WinArc JIT Core v0.3" in jit_generated
-assert "WinArc JIT: KEEPING debugger attached" in jit_generated
-assert "SKIPPING debugger prepare" in jit_generated
+assert "runWineFullSequence()" in generated
+
+# Route lock: the overlay is not allowed to mutate Madeira's JIT helper.
+assert jit_helper_path.read_bytes() == jit_helper_original
+assert "WinArc JIT Core v0.3" not in jit_helper_path.read_text(encoding="utf-8")
+assert "WINARC_LOCAL_JIT_POOL" not in jit_helper_path.read_text(encoding="utf-8")
 
 print("WINARC_MADEIRA_UI_OVERLAY=PASS")
-print("WINARC_DX11_CUBE_BRIDGE=PASS")
-print("WINARC_DX11_ARM64_ISOLATION=PASS")
-print("WINARC_JIT_CORE_V0=PASS")
-print("WINARC_JIT_DIRECT_LOCAL_POOL=PASS")
-print("WINARC_JIT_KEEP_DEBUGGER=PASS")
-print("WINARC_JIT_HOME_QUICK_CHECK=PASS")
-print("WINARC_JIT_SETTINGS=PASS")
-print("WINARC_JIT_RECOVERY=PASS")
+print("WINARC_MADEIRA_JIT_UNTOUCHED=PASS")
+print("WINARC_DX11_STOCK_PATH=PASS")
+print("WINARC_D3DMETAL_PLAN=PRESERVED")
+print("WINARC_WINE_LITE_PLAN=PRESERVED")
 print("WINARC_MADEIRA_LOG_UI=PASS")
 print("WINARC_VERSION=0.0.1")
