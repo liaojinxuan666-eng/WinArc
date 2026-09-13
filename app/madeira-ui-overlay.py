@@ -93,11 +93,18 @@ launch_hook_new = launch_hook_old + """            .onReceive(NotificationCenter
                 runWineFullSequence()
             }
             .onReceive(NotificationCenter.default.publisher(for: .winArcLaunchDX11Cube)) { _ in
+                // A/B isolation only:
+                // keep the currently working WinArc JIT Provider + Madeira
+                // runtime unchanged, but use Madeira's native ARM64 DX11 cube
+                // so FEX / ARM64EC are removed from this one test.
+                //
+                // WineProcessBridge's stock default is cube.exe and classifies
+                // cube.exe into the aarch64-windows bundle.
                 LogStore.shared.log(
-                    "[WinArc DX11] Madeira stock cube-x64.exe path"
+                    "[WinArc DX11 A/B] Madeira stock ARM64 cube.exe path (no FEX)"
                 )
 
-                setenv("MADEIRA_EXE", "cube-x64.exe", 1)
+                setenv("MADEIRA_EXE", "cube.exe", 1)
                 unsetenv("MADEIRA_ARGS")
                 unsetenv("MADEIRA_DESKTOP")
                 unsetenv("MADEIRA_SCREEN_W")
@@ -262,7 +269,8 @@ assert re.search(
 assert "winarc_graphics_backend_status_text" not in generated
 assert ".winArcLaunchDesktop" in generated
 assert ".winArcLaunchDX11Cube" in generated
-assert "cube-x64.exe" in generated
+assert "[WinArc DX11 A/B] Madeira stock ARM64 cube.exe path (no FEX)" in generated
+assert 'setenv("MADEIRA_EXE", "cube.exe", 1)' in generated
 assert "runWineFullSequence()" in generated
 
 # Route lock: the overlay is not allowed to mutate Madeira's JIT helper.
@@ -274,6 +282,7 @@ print("WINARC_MADEIRA_UI_OVERLAY=PASS")
 print("WINARC_MADEIRA_STIKJITHELPER_UNTOUCHED=PASS")
 print("WINARC_JIT_PROVIDER=INPROCESS")
 print("WINARC_DX11_STOCK_PATH=PASS")
+print("WINARC_DX11_ISOLATION=ARM64_STOCK_NO_FEX")
 print("WINARC_D3DMETAL_PLAN=PRESERVED")
 print("WINARC_WINE_LITE_PLAN=PRESERVED")
 print("WINARC_MADEIRA_LOG_UI=PASS")
