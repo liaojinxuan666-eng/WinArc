@@ -30,6 +30,11 @@ if MARKER in src:
 
 state_anchor = "static jit_log_callback_t g_log_callback = NULL;\n"
 
+log_decl = (
+    "static void jit_log(const char *fmt, ...) "
+    "__attribute__((format(printf, 1, 2)));\n"
+)
+
 state_block = r'''
 /*
  * WINARC_INPROCESS_JIT_PROVIDER_V1
@@ -130,7 +135,7 @@ static void *winarc_inprocess_prepare_region(void *addr, size_t len)
 if state_anchor not in src:
     raise SystemExit("Madeira JITAllocator state anchor changed")
 
-src = src.replace(state_anchor, state_anchor + state_block + "\n", 1)
+src = src.replace(state_anchor, state_anchor + log_decl + state_block + "\n", 1)
 
 prepare_anchor = '''__attribute__((noinline, optnone))
 void *jit26_prepare_region(void *addr, size_t len) {
