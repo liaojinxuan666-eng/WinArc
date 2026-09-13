@@ -132,7 +132,6 @@ jobs:
             ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-sha256.txt
             ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-source-commit.txt
             ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-build.log
-            ${{ runner.temp }}/winarc-runtime-patch.log
           if-no-files-found: error
           retention-days: 7
 
