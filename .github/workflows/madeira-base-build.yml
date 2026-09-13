@@ -1,4 +1,4 @@
-name: WinArc 0.0.1 Madeira Baseline
+name: WinArc 0.0.1 JIT Core
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/madeira-base-build.yml"
-      - "app/WinArcRuntime/**"
+      - "app/winarc-runtime-patch.py"
 
 permissions:
   contents: read
@@ -84,7 +84,7 @@ jobs:
           retention-days: 7
 
   app:
-    name: Build WinArc 0.0.1 from stock Madeira runtime
+    name: Build WinArc 0.0.1 capability JIT
     needs: dependencies
     runs-on: macos-15
     timeout-minutes: 120
@@ -111,6 +111,7 @@ jobs:
         run: |
           set -euo pipefail
           brew install cmake ninja
+          python3 -m py_compile app/winarc-runtime-patch.py
 
       - name: Checkout pinned Madeira base
         shell: bash
@@ -126,20 +127,15 @@ jobs:
           git -C "$M" checkout "$MADEIRA_COMMIT"
           test "$(git -C "$M" rev-parse HEAD)" = "$MADEIRA_COMMIT"
 
-      - name: Apply WinArc identity only
+      - name: Apply WinArc identity
         shell: bash
         run: |
           set -euo pipefail
           M="$RUNNER_TEMP/Madeira"
           PLIST="$M/app/Madeira/Info.plist"
 
-          /usr/libexec/PlistBuddy \
-            -c "Set :CFBundleDisplayName WinArc" \
-            "$PLIST"
-
-          /usr/libexec/PlistBuddy \
-            -c "Set :CFBundleShortVersionString $WINARC_VERSION" \
-            "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName WinArc" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $WINARC_VERSION" "$PLIST"
 
           DISPLAY="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$PLIST")"
           VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
@@ -153,7 +149,6 @@ jobs:
 
           path = Path(sys.argv[1])
           text = path.read_text()
-
           old = "PRODUCT_BUNDLE_IDENTIFIER=com.madeira.emulator"
           new = "PRODUCT_BUNDLE_IDENTIFIER=com.winarc.app"
 
@@ -163,11 +158,42 @@ jobs:
           path.write_text(text.replace(old, new, 1))
           PY
 
+      - name: Apply WinArc capability JIT core
+        shell: bash
+        run: |
+          set -euo pipefail
+          M="$RUNNER_TEMP/Madeira"
+
+          python3 app/winarc-runtime-patch.py "$M" \
+            | tee winarc-runtime-patch.log
+
+          grep -Fx "WINARC_JIT_CORE_V1=PASS" winarc-runtime-patch.log
+          grep -Fx "WINARC_VERSION=0.0.1" winarc-runtime-patch.log
+          grep -Fx "WINARC_JIT_POLICY=CAPABILITY_DRIVEN" winarc-runtime-patch.log
+
+      - name: Verify JIT-only runtime scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          M="$RUNNER_TEMP/Madeira"
+
+          grep -F "WINARC_JIT_CORE_V1" "$M/app/Madeira/JITAllocator.c"
+          grep -F "WINARC_JIT_CORE_V1" "$M/app/Madeira/JITAllocator.h"
+          grep -F "WINARC_JIT_CORE_V1" "$M/app/Madeira/StikJITHelper.swift"
+          grep -F "WINARC_JIT_CORE_V1" "$M/app/Madeira/ContentView.swift"
+
+          git -C "$M" diff --exit-code "$MADEIRA_COMMIT" -- \
+            app/Madeira/FEXBridge.mm \
+            app/Madeira/FEXBridge.h \
+            app/Madeira/WineProcessBridge.m \
+            app/Madeira/WineProcessBridge.h \
+            app/Madeira/WineServerBridge.m \
+            app/Madeira/WineServerBridge.h \
+            app/Madeira/IOSDisplayShim.m \
+            app/Madeira/Winios
+
+          echo "WINARC_JIT_ONLY_SCOPE=PASS"
           echo "WINARC_VERSION=0.0.1"
-          echo "WINARC_UI=MADEIRA_STOCK"
-          echo "WINARC_RUNTIME=MADEIRA_STOCK"
-          echo "WINARC_JIT=MADEIRA_STOCK_STIKDEBUG"
-          echo "WINARC_RUNTIME_PATCHES=NONE"
 
       - name: Download Madeira FEX package
         uses: actions/download-artifact@v4
@@ -192,39 +218,21 @@ jobs:
         run: |
           set -euo pipefail
           M="$RUNNER_TEMP/Madeira"
-
           for component in fex llvm wine; do
             test -s "$M/build-inputs/$component/$component-ios.tar.gz"
             test -s "$M/build-inputs/$component/$component-sha256.txt"
           done
 
-      - name: Verify runtime is untouched
+      - name: Build WinArc 0.0.1
         shell: bash
         run: |
           set -euo pipefail
           M="$RUNNER_TEMP/Madeira"
-
-          git -C "$M" diff --exit-code "$MADEIRA_COMMIT" -- \
-            app/Madeira/JITAllocator.c \
-            app/Madeira/JITAllocator.h \
-            app/Madeira/StikJITHelper.swift \
-            app/Madeira/FEXBridge.mm \
-            app/Madeira/WineProcessBridge.m \
-            app/Madeira/WineServerBridge.m
-
-          echo "WINARC_BASELINE_RUNTIME_UNTOUCHED=PASS"
-
-      - name: Build stock Madeira runtime as WinArc 0.0.1
-        shell: bash
-        run: |
-          set -euo pipefail
-          M="$RUNNER_TEMP/Madeira"
-
           cd "$M"
           mkdir -p ci-output
 
           bash scripts/ci-build-app.sh \
-            2>&1 | tee ci-output/winarc-0.0.1-baseline-build.log
+            2>&1 | tee ci-output/winarc-0.0.1-jit-core-build.log
 
           test -s ci-output/Madeira-unsigned.ipa
 
@@ -234,17 +242,15 @@ jobs:
           set -euo pipefail
           M="$RUNNER_TEMP/Madeira"
           P="$RUNNER_TEMP/WinArcPackage"
-          OUT="$GITHUB_WORKSPACE/WinArc-0.0.1-Madeira-baseline-unsigned.ipa"
+          OUT="$GITHUB_WORKSPACE/WinArc-0.0.1-jit-core-unsigned.ipa"
 
           rm -rf "$P"
           mkdir -p "$P"
 
           unzip -q "$M/ci-output/Madeira-unsigned.ipa" -d "$P"
-
           test -d "$P/Payload/Madeira.app"
 
           mv "$P/Payload/Madeira.app" "$P/Payload/WinArc.app"
-
           PLIST="$P/Payload/WinArc.app/Info.plist"
 
           DISPLAY="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$PLIST")"
@@ -263,26 +269,26 @@ jobs:
           test -s "$OUT"
           unzip -t "$OUT" | tail -1
 
-          echo "WINARC_BASELINE=PASS"
+          echo "WINARC_BUILD=PASS"
           echo "WINARC_VERSION=0.0.1"
-          echo "WINARC_UI=MADEIRA_STOCK"
-          echo "WINARC_RUNTIME_PATCHES=NONE"
+          echo "WINARC_JIT_CORE=CAPABILITY_DRIVEN"
 
-      - name: Upload WinArc baseline IPA
+      - name: Upload WinArc IPA
         uses: actions/upload-artifact@v4
         with:
-          name: WinArc-0.0.1-Madeira-baseline-unsigned-ipa
-          path: WinArc-0.0.1-Madeira-baseline-unsigned.ipa
+          name: WinArc-0.0.1-jit-core-unsigned-ipa
+          path: WinArc-0.0.1-jit-core-unsigned.ipa
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload baseline diagnostics
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: WinArc-0.0.1-Madeira-baseline-logs
+          name: WinArc-0.0.1-jit-core-logs
           path: |
-            ${{ runner.temp }}/Madeira/ci-output/winarc-0.0.1-baseline-build.log
+            winarc-runtime-patch.log
+            ${{ runner.temp }}/Madeira/ci-output/winarc-0.0.1-jit-core-build.log
             ${{ runner.temp }}/Madeira/ci-output/linked-libraries.txt
             ${{ runner.temp }}/Madeira/build/dxmt-ios/obj/*.err
           if-no-files-found: warn
