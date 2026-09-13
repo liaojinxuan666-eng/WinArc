@@ -1,4 +1,4 @@
-name: WinArc 0.0.1 JIT Core
+name: WinArc 0.0.1 JIT + PE Protect
 
 on:
   workflow_dispatch:
@@ -28,6 +28,9 @@ jobs:
       MADEIRA_COMMIT: daabd75fc4b09ab32196a2eec010537bf018e108
 
     steps:
+      - name: Checkout WinArc
+        uses: actions/checkout@v4
+
       - name: Select Xcode 26.3
         shell: bash
         run: |
@@ -42,6 +45,7 @@ jobs:
           brew install cmake ninja
           if [ "${{ matrix.component }}" = "wine" ]; then
             brew install bison llvm gnutls pkg-config
+            python3 -m py_compile app/winarc-runtime-patch.py
           fi
 
       - name: Checkout pinned Madeira base
@@ -57,6 +61,23 @@ jobs:
             "$M"
           git -C "$M" checkout "$MADEIRA_COMMIT"
           test "$(git -C "$M" rev-parse HEAD)" = "$MADEIRA_COMMIT"
+
+      - name: Apply WinArc Wine PE protection fix
+        if: matrix.component == 'wine'
+        shell: bash
+        run: |
+          set -euo pipefail
+          M="$RUNNER_TEMP/Madeira"
+
+          python3 app/winarc-runtime-patch.py "$M" --wine-only \
+            | tee winarc-wine-patch.log
+
+          grep -Fx "WINARC_WINE_PE_SOURCE_PROTECT_V1=PASS" winarc-wine-patch.log
+          grep -Fx "WINARC_VERSION=0.0.1" winarc-wine-patch.log
+          grep -Fx "WINARC_WINE_PATCHES=PE_SOURCE_PROTECT_V1" winarc-wine-patch.log
+
+          grep -F "WINARC_PE_SOURCE_PROTECT_V1" \
+            "$M/build/ntdll-unix/virtual_ios.c"
 
       - name: Build ${{ matrix.component }}
         shell: bash
@@ -80,11 +101,12 @@ jobs:
             ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-sha256.txt
             ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-source-commit.txt
             ${{ runner.temp }}/Madeira/ci-output/${{ matrix.component }}-build.log
-          if-no-files-found: error
+            winarc-wine-patch.log
+          if-no-files-found: warn
           retention-days: 7
 
   app:
-    name: Build WinArc 0.0.1 capability JIT
+    name: Build WinArc 0.0.1
     needs: dependencies
     runs-on: macos-15
     timeout-minutes: 120
@@ -158,7 +180,7 @@ jobs:
           path.write_text(text.replace(old, new, 1))
           PY
 
-      - name: Apply WinArc capability JIT core
+      - name: Apply WinArc runtime patches
         shell: bash
         run: |
           set -euo pipefail
@@ -167,11 +189,13 @@ jobs:
           python3 app/winarc-runtime-patch.py "$M" \
             | tee winarc-runtime-patch.log
 
+          grep -Fx "WINARC_WINE_PE_SOURCE_PROTECT_V1=PASS" winarc-runtime-patch.log
           grep -Fx "WINARC_JIT_CORE_V1=PASS" winarc-runtime-patch.log
           grep -Fx "WINARC_VERSION=0.0.1" winarc-runtime-patch.log
           grep -Fx "WINARC_JIT_POLICY=CAPABILITY_DRIVEN" winarc-runtime-patch.log
+          grep -Fx "WINARC_WINE_PATCHES=PE_SOURCE_PROTECT_V1" winarc-runtime-patch.log
 
-      - name: Verify JIT-only runtime scope
+      - name: Verify WinArc runtime scope
         shell: bash
         run: |
           set -euo pipefail
@@ -181,6 +205,8 @@ jobs:
           grep -F "WINARC_JIT_CORE_V1" "$M/app/Madeira/JITAllocator.h"
           grep -F "WINARC_JIT_CORE_V1" "$M/app/Madeira/StikJITHelper.swift"
           grep -F "WINARC_JIT_CORE_V1" "$M/app/Madeira/ContentView.swift"
+          grep -F "WINARC_PE_SOURCE_PROTECT_V1" "$M/build/ntdll-unix/virtual_ios.c"
+          grep -F "winarc_restore_pe_source_protection" "$M/build/ntdll-unix/virtual_ios.c"
 
           git -C "$M" diff --exit-code "$MADEIRA_COMMIT" -- \
             app/Madeira/FEXBridge.mm \
@@ -192,7 +218,7 @@ jobs:
             app/Madeira/IOSDisplayShim.m \
             app/Madeira/Winios
 
-          echo "WINARC_JIT_ONLY_SCOPE=PASS"
+          echo "WINARC_RUNTIME_SCOPE=PASS"
           echo "WINARC_VERSION=0.0.1"
 
       - name: Download Madeira FEX package
@@ -232,7 +258,7 @@ jobs:
           mkdir -p ci-output
 
           bash scripts/ci-build-app.sh \
-            2>&1 | tee ci-output/winarc-0.0.1-jit-core-build.log
+            2>&1 | tee ci-output/winarc-0.0.1-build.log
 
           test -s ci-output/Madeira-unsigned.ipa
 
@@ -242,7 +268,7 @@ jobs:
           set -euo pipefail
           M="$RUNNER_TEMP/Madeira"
           P="$RUNNER_TEMP/WinArcPackage"
-          OUT="$GITHUB_WORKSPACE/WinArc-0.0.1-jit-core-unsigned.ipa"
+          OUT="$GITHUB_WORKSPACE/WinArc-0.0.1-unsigned.ipa"
 
           rm -rf "$P"
           mkdir -p "$P"
@@ -272,12 +298,13 @@ jobs:
           echo "WINARC_BUILD=PASS"
           echo "WINARC_VERSION=0.0.1"
           echo "WINARC_JIT_CORE=CAPABILITY_DRIVEN"
+          echo "WINARC_WINE_PE_PROTECT=V1"
 
       - name: Upload WinArc IPA
         uses: actions/upload-artifact@v4
         with:
-          name: WinArc-0.0.1-jit-core-unsigned-ipa
-          path: WinArc-0.0.1-jit-core-unsigned.ipa
+          name: WinArc-0.0.1-unsigned-ipa
+          path: WinArc-0.0.1-unsigned.ipa
           if-no-files-found: error
           retention-days: 14
 
@@ -285,10 +312,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: WinArc-0.0.1-jit-core-logs
+          name: WinArc-0.0.1-logs
           path: |
             winarc-runtime-patch.log
-            ${{ runner.temp }}/Madeira/ci-output/winarc-0.0.1-jit-core-build.log
+            ${{ runner.temp }}/Madeira/ci-output/winarc-0.0.1-build.log
             ${{ runner.temp }}/Madeira/ci-output/linked-libraries.txt
             ${{ runner.temp }}/Madeira/build/dxmt-ios/obj/*.err
           if-no-files-found: warn
