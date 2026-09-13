@@ -96,7 +96,7 @@ final class WinArcJITManager: ObservableObject {
         }
     }
 
-    var effectivePoolMB: Int { 0 }
+    var effectivePoolMB: Int { 256 }
     var effectiveStrategy: WinArcJITStrategy { .localDualMap }
 
     func runQuickCheckIfNeeded() {
@@ -228,11 +228,19 @@ final class WinArcJITManager: ObservableObject {
             for: .documentDirectory,
             in: .userDomainMask
         )[0]
-        let oldPoolOverride = docs.appendingPathComponent("madeira-pool.txt")
-        try? FileManager.default.removeItem(at: oldPoolOverride)
+        // Madeira itself supports Documents/madeira-pool.txt as a runtime
+        // pool-size override. Keep the stock allocator/prepare/detach path,
+        // but use a conservative 256MB pool on this device class instead of
+        // Madeira's 896MB Steam/CEF-oriented default.
+        let poolOverride = docs.appendingPathComponent("madeira-pool.txt")
+        try? "256\n".write(
+            to: poolOverride,
+            atomically: true,
+            encoding: .utf8
+        )
 
         LogStore.shared.log(
-            "[WinArc Runtime] stock Madeira JIT path enforced; no JIT override applied"
+            "[WinArc Runtime] Madeira stock JIT path; native pool override=256MB"
         )
     }
 
