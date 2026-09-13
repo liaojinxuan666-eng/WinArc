@@ -1,14 +1,12 @@
-name: WinArc Madeira Base Build
+name: WinArc 0.0.1 Madeira Baseline
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - "app/WinArc/**"
-      - "app/MadeiraOverlay/**"
-      - "app/madeira-ui-overlay.py"
       - ".github/workflows/madeira-base-build.yml"
+      - "app/WinArcRuntime/**"
 
 permissions:
   contents: read
@@ -22,10 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component:
-          - fex
-          - llvm
-          - wine
+        component: [fex, llvm, wine]
 
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -44,9 +39,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           brew install cmake ninja
-
           if [ "${{ matrix.component }}" = "wine" ]; then
             brew install bison llvm gnutls pkg-config
           fi
@@ -55,44 +48,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           M="$RUNNER_TEMP/Madeira"
-
           rm -rf "$M"
-
           git clone \
             --filter=blob:none \
             --no-checkout \
             https://github.com/arjunyerevan95-dot/Madeira.git \
             "$M"
-
           git -C "$M" checkout "$MADEIRA_COMMIT"
-
-          test \
-            "$(git -C "$M" rev-parse HEAD)" \
-            = "$MADEIRA_COMMIT"
+          test "$(git -C "$M" rev-parse HEAD)" = "$MADEIRA_COMMIT"
 
       - name: Build ${{ matrix.component }}
         shell: bash
         run: |
           set -euo pipefail
-
           M="$RUNNER_TEMP/Madeira"
-
           cd "$M"
-
           mkdir -p ci-output
-
           bash scripts/ci-build-dependency.sh \
             "${{ matrix.component }}" \
-            2>&1 | tee \
-            "ci-output/${{ matrix.component }}-build.log"
-
-          test -s \
-            "ci-output/${{ matrix.component }}-ios.tar.gz"
-
-          test -s \
-            "ci-output/${{ matrix.component }}-sha256.txt"
+            2>&1 | tee "ci-output/${{ matrix.component }}-build.log"
+          test -s "ci-output/${{ matrix.component }}-ios.tar.gz"
+          test -s "ci-output/${{ matrix.component }}-sha256.txt"
 
       - name: Upload ${{ matrix.component }} package
         uses: actions/upload-artifact@v4
@@ -107,9 +84,8 @@ jobs:
           retention-days: 7
 
   app:
-    name: Build WinArc app on Madeira
+    name: Build WinArc 0.0.1 from stock Madeira runtime
     needs: dependencies
-
     runs-on: macos-15
     timeout-minutes: 120
 
@@ -117,6 +93,7 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       MADEIRA_COMMIT: daabd75fc4b09ab32196a2eec010537bf018e108
+      WINARC_VERSION: 0.0.1
 
     steps:
       - name: Checkout WinArc
@@ -126,67 +103,71 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           test -d "$DEVELOPER_DIR"
-
           xcodebuild -version
 
       - name: Install app build tools
         shell: bash
         run: |
           set -euo pipefail
-
           brew install cmake ninja
 
       - name: Checkout pinned Madeira base
         shell: bash
         run: |
           set -euo pipefail
-
           M="$RUNNER_TEMP/Madeira"
-
           rm -rf "$M"
-
           git clone \
             --filter=blob:none \
             --no-checkout \
             https://github.com/arjunyerevan95-dot/Madeira.git \
             "$M"
-
           git -C "$M" checkout "$MADEIRA_COMMIT"
+          test "$(git -C "$M" rev-parse HEAD)" = "$MADEIRA_COMMIT"
 
-          test \
-            "$(git -C "$M" rev-parse HEAD)" \
-            = "$MADEIRA_COMMIT"
-
-      - name: Attach WinArc UI to Madeira app
+      - name: Apply WinArc identity only
         shell: bash
         run: |
           set -euo pipefail
-
           M="$RUNNER_TEMP/Madeira"
+          PLIST="$M/app/Madeira/Info.plist"
 
-          python3 \
-            app/madeira-ui-overlay.py \
-            "$M" \
-            "$GITHUB_WORKSPACE" \
-            | tee madeira-ui-overlay.log
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleDisplayName WinArc" \
+            "$PLIST"
 
-          grep -Fx \
-            "WINARC_MADEIRA_UI_OVERLAY=PASS" \
-            madeira-ui-overlay.log
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleShortVersionString $WINARC_VERSION" \
+            "$PLIST"
 
-          grep -F \
-            "struct MadeiraLegacyContentView: View" \
-            "$M/app/Madeira/ContentView.swift"
+          DISPLAY="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$PLIST")"
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
 
-          grep -F \
-            "struct RootView: View" \
-            "$M/app/Madeira/ContentView.swift"
+          test "$DISPLAY" = "WinArc"
+          test "$VERSION" = "0.0.1"
 
-          grep -F \
-            "RootView()" \
-            "$M/app/Madeira/MadeiraApp.swift"
+          python3 - "$M/scripts/ci-build-app.sh" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+
+          old = "PRODUCT_BUNDLE_IDENTIFIER=com.madeira.emulator"
+          new = "PRODUCT_BUNDLE_IDENTIFIER=com.winarc.app"
+
+          if old not in text:
+              raise SystemExit("Madeira bundle-id build argument changed")
+
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+          echo "WINARC_VERSION=0.0.1"
+          echo "WINARC_UI=MADEIRA_STOCK"
+          echo "WINARC_RUNTIME=MADEIRA_STOCK"
+          echo "WINARC_JIT=MADEIRA_STOCK_STIKDEBUG"
+          echo "WINARC_RUNTIME_PATCHES=NONE"
 
       - name: Download Madeira FEX package
         uses: actions/download-artifact@v4
@@ -210,141 +191,98 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           M="$RUNNER_TEMP/Madeira"
 
           for component in fex llvm wine; do
-            test -s \
-              "$M/build-inputs/$component/$component-ios.tar.gz"
-
-            test -s \
-              "$M/build-inputs/$component/$component-sha256.txt"
+            test -s "$M/build-inputs/$component/$component-ios.tar.gz"
+            test -s "$M/build-inputs/$component/$component-sha256.txt"
           done
 
-      - name: Build complete Madeira runtime with WinArc UI
+      - name: Verify runtime is untouched
         shell: bash
         run: |
           set -euo pipefail
-
           M="$RUNNER_TEMP/Madeira"
 
-          python3 - \
-            "$M/scripts/ci-build-app.sh" <<'PY'
-          from pathlib import Path
-          import sys
+          git -C "$M" diff --exit-code "$MADEIRA_COMMIT" -- \
+            app/Madeira/JITAllocator.c \
+            app/Madeira/JITAllocator.h \
+            app/Madeira/StikJITHelper.swift \
+            app/Madeira/FEXBridge.mm \
+            app/Madeira/WineProcessBridge.m \
+            app/Madeira/WineServerBridge.m
 
-          p = Path(sys.argv[1])
+          echo "WINARC_BASELINE_RUNTIME_UNTOUCHED=PASS"
 
-          s = p.read_text()
-
-          old = "PRODUCT_BUNDLE_IDENTIFIER=com.madeira.emulator"
-
-          if old not in s:
-              raise SystemExit(
-                  "Madeira bundle-id build argument changed"
-              )
-
-          p.write_text(
-              s.replace(
-                  old,
-                  "PRODUCT_BUNDLE_IDENTIFIER=com.winarc.app",
-                  1
-              )
-          )
-          PY
+      - name: Build stock Madeira runtime as WinArc 0.0.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          M="$RUNNER_TEMP/Madeira"
 
           cd "$M"
-
           mkdir -p ci-output
 
           bash scripts/ci-build-app.sh \
-            2>&1 | tee \
-            ci-output/winarc-app-build.log
+            2>&1 | tee ci-output/winarc-0.0.1-baseline-build.log
 
-          test -s \
-            ci-output/Madeira-unsigned.ipa
+          test -s ci-output/Madeira-unsigned.ipa
 
-      - name: Repackage as WinArc IPA
+      - name: Repackage WinArc 0.0.1 IPA
         shell: bash
         run: |
           set -euo pipefail
-
           M="$RUNNER_TEMP/Madeira"
           P="$RUNNER_TEMP/WinArcPackage"
-          OUT="$GITHUB_WORKSPACE/WinArc-Madeira-base-unsigned.ipa"
+          OUT="$GITHUB_WORKSPACE/WinArc-0.0.1-Madeira-baseline-unsigned.ipa"
 
           rm -rf "$P"
-
           mkdir -p "$P"
 
-          unzip -q \
-            "$M/ci-output/Madeira-unsigned.ipa" \
-            -d "$P"
+          unzip -q "$M/ci-output/Madeira-unsigned.ipa" -d "$P"
 
-          test -d \
-            "$P/Payload/Madeira.app"
+          test -d "$P/Payload/Madeira.app"
 
-          mv \
-            "$P/Payload/Madeira.app" \
-            "$P/Payload/WinArc.app"
+          mv "$P/Payload/Madeira.app" "$P/Payload/WinArc.app"
 
-          test -s \
-            "$P/Payload/WinArc.app/Madeira"
+          PLIST="$P/Payload/WinArc.app/Info.plist"
 
-          DISPLAY="$(
-            /usr/libexec/PlistBuddy \
-              -c 'Print :CFBundleDisplayName' \
-              "$P/Payload/WinArc.app/Info.plist"
-          )"
+          DISPLAY="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$PLIST")"
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")"
 
-          BUNDLE_ID="$(
-            /usr/libexec/PlistBuddy \
-              -c 'Print :CFBundleIdentifier' \
-              "$P/Payload/WinArc.app/Info.plist"
-          )"
-
-          test \
-            "$DISPLAY" \
-            = "WinArc"
-
-          test \
-            "$BUNDLE_ID" \
-            = "com.winarc.app"
+          test "$DISPLAY" = "WinArc"
+          test "$VERSION" = "0.0.1"
+          test "$BUNDLE_ID" = "com.winarc.app"
 
           (
             cd "$P"
-
-            /usr/bin/zip \
-              -qry \
-              "$OUT" \
-              Payload
+            /usr/bin/zip -qry "$OUT" Payload
           )
 
           test -s "$OUT"
-
           unzip -t "$OUT" | tail -1
 
-          echo "WINARC_PRODUCT_UI=PASS"
-          echo "WINARC_MADEIRA_RUNTIME_BASE=PASS"
-          echo "WINARC_MADEIRA_IPA=PASS"
+          echo "WINARC_BASELINE=PASS"
+          echo "WINARC_VERSION=0.0.1"
+          echo "WINARC_UI=MADEIRA_STOCK"
+          echo "WINARC_RUNTIME_PATCHES=NONE"
 
-      - name: Upload WinArc Madeira IPA
+      - name: Upload WinArc baseline IPA
         uses: actions/upload-artifact@v4
         with:
-          name: WinArc-Madeira-base-unsigned-ipa
-          path: WinArc-Madeira-base-unsigned.ipa
+          name: WinArc-0.0.1-Madeira-baseline-unsigned-ipa
+          path: WinArc-0.0.1-Madeira-baseline-unsigned.ipa
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload integration diagnostics
+      - name: Upload baseline diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: WinArc-Madeira-base-logs
+          name: WinArc-0.0.1-Madeira-baseline-logs
           path: |
-            madeira-ui-overlay.log
-            ${{ runner.temp }}/Madeira/ci-output/app-build.log
-            ${{ runner.temp }}/Madeira/ci-output/winarc-app-build.log
+            ${{ runner.temp }}/Madeira/ci-output/winarc-0.0.1-baseline-build.log
             ${{ runner.temp }}/Madeira/ci-output/linked-libraries.txt
             ${{ runner.temp }}/Madeira/build/dxmt-ios/obj/*.err
           if-no-files-found: warn
