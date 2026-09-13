@@ -81,7 +81,51 @@ native_pool_impl = r'''
 // ===== WINARC_JIT_CORE_V1: native capability-backed pool =====
 // Thin wrapper around Madeira's existing jit_region_create() allocator.
 // No Wine/FEX/DXMT patching and no jit26_* replacement.
+//
+// Madeira's legacy StikDebug path performs one provider-independent placement
+// preparation step before asking the debugger for the pool: reserve low
+// VM_FLAGS_ANYWHERE space until the allocation frontier crosses 0x119000000.
+// FEX's current dispatcher encoding is known to fail below that address.
+// Native-direct must preserve the same placement invariant.
 static JITRegion *g_winarc_native_pool = NULL;
+static vm_address_t g_winarc_pin_chunks[32];
+static int g_winarc_pin_count = 0;
+static bool g_winarc_pin_frontier_ready = false;
+
+static bool winarc_jit_prepare_low_frontier(void) {
+    if (g_winarc_pin_frontier_ready) return true;
+
+    const vm_address_t target = (vm_address_t)0x119000000ULL;
+    const vm_size_t chunk_size = (vm_size_t)(16ULL * 1024ULL * 1024ULL);
+
+    for (int i = g_winarc_pin_count; i < 32; ++i) {
+        vm_address_t addr = 0;
+        kern_return_t kr = vm_allocate(mach_task_self(), &addr, chunk_size,
+                                       VM_FLAGS_ANYWHERE);
+        if (kr != KERN_SUCCESS) {
+            jit_log("[WinArc JIT] low-VA pin failed chunk=%d kr=%d", i, kr);
+            return false;
+        }
+
+        g_winarc_pin_chunks[g_winarc_pin_count++] = addr;
+        jit_log("[WinArc JIT] low-VA pin chunk=%d addr=0x%llx end=0x%llx",
+                i,
+                (unsigned long long)addr,
+                (unsigned long long)(addr + chunk_size));
+
+        if (addr + chunk_size >= target) {
+            g_winarc_pin_frontier_ready = true;
+            jit_log("[WinArc JIT] low-VA frontier READY at 0x%llx target=0x%llx",
+                    (unsigned long long)(addr + chunk_size),
+                    (unsigned long long)target);
+            return true;
+        }
+    }
+
+    jit_log("[WinArc JIT] low-VA frontier did not reach 0x%llx after %d chunks",
+            (unsigned long long)target, g_winarc_pin_count);
+    return false;
+}
 
 bool winarc_jit_native_pool_create(size_t size, void **rx_out, void **rw_out) {
     if (!rx_out || !rw_out || size == 0) return false;
@@ -97,30 +141,64 @@ bool winarc_jit_native_pool_create(size_t size, void **rx_out, void **rw_out) {
     const uintptr_t guest_lo = 0x7000000000ULL;
     const uintptr_t guest_hi = 0x8000000000ULL;
 
-    for (int attempt = 0; attempt < 4; ++attempt) {
+    // Reserve only; never touch the pin pages. Keep them alive for process
+    // lifetime so the kernel cannot immediately recycle the low holes.
+    if (!winarc_jit_prepare_low_frontier()) {
+        jit_log("[WinArc JIT] native pool aborted: low-VA frontier prep failed");
+        *rx_out = NULL;
+        *rw_out = NULL;
+        return false;
+    }
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
         JITRegion *region = jit_region_create(size);
-        if (!region) continue;
+        if (!region) {
+            jit_log("[WinArc JIT] native pool create failed attempt=%d", attempt + 1);
+            continue;
+        }
 
         uintptr_t rx = (uintptr_t)jit_region_rx_ptr(region);
         uintptr_t end = rx + size;
         bool overflow = end < rx;
+        bool too_low = !overflow && rx < good_low;
         bool overlaps_guest = !overflow && end > guest_lo && rx < guest_hi;
-        bool placement_ok = !overflow && rx >= good_low && !overlaps_guest;
 
-        if (!placement_ok) {
-            jit_log("[WinArc JIT] reject native pool attempt=%d RX=%p size=%zu guest=%d overflow=%d",
-                    attempt + 1, jit_region_rx_ptr(region), size,
-                    overlaps_guest ? 1 : 0, overflow ? 1 : 0);
-            jit_region_destroy(region);
-            continue;
+        if (!overflow && !too_low && !overlaps_guest) {
+            g_winarc_native_pool = region;
+            *rx_out = jit_region_rx_ptr(region);
+            *rw_out = jit_region_rw_ptr(region);
+            jit_log("[WinArc JIT] native pool READY RX=%p RW=%p size=%zu",
+                    *rx_out, *rw_out, size);
+            return true;
         }
 
-        g_winarc_native_pool = region;
-        *rx_out = jit_region_rx_ptr(region);
-        *rw_out = jit_region_rw_ptr(region);
-        jit_log("[WinArc JIT] native pool READY RX=%p RW=%p size=%zu",
-                *rx_out, *rw_out, size);
-        return true;
+        const char *reason = overflow ? "overflow" :
+                             (too_low ? "mode-A-low" : "guest-64G-window");
+        jit_log("[WinArc JIT] reject native pool attempt=%d RX=%p size=%zu reason=%s",
+                attempt + 1, jit_region_rx_ptr(region), size, reason);
+        jit_region_destroy(region);
+
+        // Madeira measured that freeing a guest-window mapping and blindly
+        // retrying often returns the identical hole. Stop there rather than
+        // pretending a re-roll is a strategy.
+        if (overlaps_guest || overflow) break;
+
+        // ASLR can leave a small gap below 0x119000000 even after the frontier
+        // sweep. Reserve one extra chunk and make one final attempt.
+        if (too_low && g_winarc_pin_count < 32) {
+            vm_address_t addr = 0;
+            const vm_size_t chunk_size = (vm_size_t)(16ULL * 1024ULL * 1024ULL);
+            kern_return_t kr = vm_allocate(mach_task_self(), &addr, chunk_size,
+                                           VM_FLAGS_ANYWHERE);
+            if (kr == KERN_SUCCESS) {
+                g_winarc_pin_chunks[g_winarc_pin_count++] = addr;
+                jit_log("[WinArc JIT] extra low-VA pin addr=0x%llx",
+                        (unsigned long long)addr);
+            } else {
+                jit_log("[WinArc JIT] extra low-VA pin failed kr=%d", kr);
+                break;
+            }
+        }
     }
 
     *rx_out = NULL;
@@ -398,6 +476,21 @@ pool_new = "let pool = WinArcJITCore.allocatePool(poolSize: poolSizeMB * 1024 * 
 if pool_old not in content:
     raise SystemExit("ContentView pool allocation call changed")
 content = content.replace(pool_old, pool_new, 1)
+
+pool_fail_old = '''                logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
+                logStore.log("  All placements landed in the forbidden guest 64G window.", level: .info)
+                logStore.log("  Force-quit and relaunch: placement is chosen by the kernel", level: .info)
+                logStore.log("  and depends on current memory layout, so a fresh process", level: .info)
+                logStore.log("  usually lands somewhere valid.", level: .info)
+'''
+pool_fail_new = '''                logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
+                logStore.log("  See [WinArc JIT] lines above for the exact placement reason.", level: .info)
+                logStore.log("  native-direct rejects mode-A-low and guest-window placements.", level: .info)
+                logStore.log("  Do not infer the cause from the final nil alone.", level: .info)
+'''
+if pool_fail_old not in content:
+    raise SystemExit("ContentView pool failure text changed")
+content = content.replace(pool_fail_old, pool_fail_new, 1)
 
 if "StikJITHelper.detachDebugger()" not in content:
     raise SystemExit("ContentView detach call not found")
