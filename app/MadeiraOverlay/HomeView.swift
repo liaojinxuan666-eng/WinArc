@@ -6,6 +6,8 @@ struct HomeView: View {
     let onImportGame: () -> Void
 
     @StateObject private var jit = WinArcJITManager.shared
+    @StateObject private var runtime = WinArcRuntimeTuning.shared
+
     @State private var showMadeiraRuntime = false
     @State private var showJITSettings = false
     @State private var showLaunchError = false
@@ -15,6 +17,7 @@ struct HomeView: View {
             VStack(alignment: .leading, spacing: 24) {
                 hero
                 jitCard
+                runtimeCard
                 desktopCard
                 libraryContent
             }
@@ -23,6 +26,7 @@ struct HomeView: View {
         }
         .onAppear {
             jit.runQuickCheckIfNeeded()
+            runtime.applyEnvironment()
         }
         .sheet(isPresented: $showJITSettings) {
             JITSettingsView()
@@ -42,7 +46,11 @@ struct HomeView: View {
             ZStack(alignment: .topLeading) {
                 MadeiraLegacyContentView()
                     .onAppear {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        runtime.applyEnvironment()
+
+                        DispatchQueue.main.asyncAfter(
+                            deadline: .now() + 0.35
+                        ) {
                             NotificationCenter.default.post(
                                 name: .winArcLaunchDesktop,
                                 object: nil
@@ -81,7 +89,13 @@ struct HomeView: View {
 
             VStack(alignment: .leading, spacing: 13) {
                 Text("Windows games.\nYour way.")
-                    .font(.system(size: 40, weight: .bold, design: .rounded))
+                    .font(
+                        .system(
+                            size: 40,
+                            weight: .bold,
+                            design: .rounded
+                        )
+                    )
 
                 Text(
                     store.containers.isEmpty
@@ -91,11 +105,19 @@ struct HomeView: View {
                 .foregroundStyle(.white.opacity(0.66))
 
                 Button(
-                    action: store.containers.isEmpty ? onCreateContainer : onImportGame
+                    action:
+                        store.containers.isEmpty
+                        ? onCreateContainer
+                        : onImportGame
                 ) {
                     Label(
-                        store.containers.isEmpty ? "创建容器" : "导入游戏",
-                        systemImage: store.containers.isEmpty ? "plus" : "square.and.arrow.down"
+                        store.containers.isEmpty
+                        ? "创建容器"
+                        : "导入游戏",
+                        systemImage:
+                            store.containers.isEmpty
+                            ? "plus"
+                            : "square.and.arrow.down"
                     )
                     .fontWeight(.semibold)
                     .padding(.horizontal, 18)
@@ -109,7 +131,12 @@ struct HomeView: View {
             .padding(28)
         }
         .frame(height: 285)
-        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .clipShape(
+            RoundedRectangle(
+                cornerRadius: 28,
+                style: .continuous
+            )
+        )
     }
 
     private var jitCard: some View {
@@ -138,11 +165,26 @@ struct HomeView: View {
                 .foregroundStyle(WinArcTheme.secondary)
 
             HStack(spacing: 18) {
-                jitMetric("Debugger", jit.debuggerAttached ? "OK" : "—")
-                jitMetric("Dual Map", jit.dualMappingAvailable ? "OK" : "—")
-                jitMetric("Execute", jit.executionValidated ? "OK" : "未测")
-                jitMetric("Pool", "\(jit.effectivePoolMB)MB")
-                jitMetric("Memory", "\(jit.physicalFootprintMB)MB")
+                jitMetric(
+                    "Debugger",
+                    jit.debuggerAttached ? "OK" : "—"
+                )
+                jitMetric(
+                    "Dual Map",
+                    jit.dualMappingAvailable ? "OK" : "—"
+                )
+                jitMetric(
+                    "Execute",
+                    jit.executionValidated ? "OK" : "未测"
+                )
+                jitMetric(
+                    "Pool",
+                    "\(jit.effectivePoolMB)MB"
+                )
+                jitMetric(
+                    "Memory",
+                    "\(jit.physicalFootprintMB)MB"
+                )
 
                 Spacer()
 
@@ -170,11 +212,38 @@ struct HomeView: View {
         .winArcGlass()
     }
 
+    private var runtimeCard: some View {
+        HStack(spacing: 16) {
+            Image(systemName: "gauge.with.dots.needle.50percent")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(.green)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Wine Runtime")
+                    .font(.headline)
+
+                Text(
+                    "\(runtime.wineProfile.title) · " +
+                    "DXMT 已接入 · D3DMetal Probe 已准备"
+                )
+                .font(.footnote)
+                .foregroundStyle(WinArcTheme.secondary)
+            }
+
+            Spacer()
+        }
+        .padding(18)
+        .winArcGlass()
+    }
+
     private var desktopCard: some View {
         HStack(spacing: 16) {
             ZStack {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color.blue.opacity(0.16))
+                RoundedRectangle(
+                    cornerRadius: 14,
+                    style: .continuous
+                )
+                .fill(Color.blue.opacity(0.16))
 
                 Image(systemName: "desktopcomputer")
                     .font(.system(size: 25, weight: .semibold))
@@ -190,16 +259,23 @@ struct HomeView: View {
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(WinArcTheme.secondary)
 
-                Text("启动只做安全 Preflight；高级 Self Test 不再是启动门槛。")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.42))
+                Text(
+                    "当前 Wine Profile：" +
+                    runtime.wineProfile.title
+                )
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white.opacity(0.42))
             }
 
             Spacer()
 
             Button(
-                jit.isPreparingRuntime ? "JIT 预检中…" : "启动桌面"
+                jit.isPreparingRuntime
+                ? "JIT 预检中…"
+                : "启动桌面"
             ) {
+                runtime.applyEnvironment()
+
                 jit.validateForRuntimeLaunch { passed in
                     if passed {
                         showMadeiraRuntime = true
@@ -252,7 +328,10 @@ struct HomeView: View {
         }
     }
 
-    private func jitMetric(_ title: String, _ value: String) -> some View {
+    private func jitMetric(
+        _ title: String,
+        _ value: String
+    ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title)
                 .font(.caption2)
