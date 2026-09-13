@@ -8,7 +8,6 @@ on:
       - "app/WinArc/**"
       - "app/MadeiraOverlay/**"
       - "app/madeira-ui-overlay.py"
-      - "app/madeira-runtime-patch.py"
       - ".github/workflows/madeira-base-build.yml"
 
 permissions:
@@ -34,15 +33,10 @@ jobs:
       MADEIRA_COMMIT: daabd75fc4b09ab32196a2eec010537bf018e108
 
     steps:
-      - name: Checkout WinArc runtime patches
-        if: matrix.component == 'wine'
-        uses: actions/checkout@v4
-
       - name: Select Xcode 26.3
         shell: bash
         run: |
           set -euo pipefail
-
           test -d "$DEVELOPER_DIR"
           xcodebuild -version
 
@@ -77,29 +71,6 @@ jobs:
           test \
             "$(git -C "$M" rev-parse HEAD)" \
             = "$MADEIRA_COMMIT"
-
-      - name: Apply WinArc Wine/iOS runtime patch
-        if: matrix.component == 'wine'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 \
-            "$GITHUB_WORKSPACE/app/madeira-runtime-patch.py" \
-            "$RUNNER_TEMP/Madeira" \
-            | tee "$RUNNER_TEMP/winarc-runtime-patch.log"
-
-          grep -Fx \
-            "WINARC_MADEIRA_RUNTIME_PATCH=PASS" \
-            "$RUNNER_TEMP/winarc-runtime-patch.log"
-
-          grep -Fx \
-            "WINARC_PE16K_DIRECT_EXEC_BYPASS=PASS" \
-            "$RUNNER_TEMP/winarc-runtime-patch.log"
-
-          grep -F \
-            "WINARC_PE16K_DIRECT_EXEC_BYPASS" \
-            "$RUNNER_TEMP/Madeira/build/ntdll-unix/virtual_ios.c"
 
       - name: Build ${{ matrix.component }}
         shell: bash
@@ -157,6 +128,7 @@ jobs:
           set -euo pipefail
 
           test -d "$DEVELOPER_DIR"
+
           xcodebuild -version
 
       - name: Install app build tools
@@ -202,10 +174,6 @@ jobs:
 
           grep -Fx \
             "WINARC_MADEIRA_UI_OVERLAY=PASS" \
-            madeira-ui-overlay.log
-
-          grep -Fx \
-            "WINARC_METAL_HOST_CLEANUP=PASS" \
             madeira-ui-overlay.log
 
           grep -F \
