@@ -136,7 +136,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
     wine = wine.replace(helper_anchor, helper, 1)
 
     # V2 root fix: Madeira's force_exec_prot runs BEFORE the iOS JIT-pool
-    # branch.  V1 intercepted only the later explicit PROT_EXEC path, so a
+    # branch. V1 intercepted only the later explicit PROT_EXEC path, so a
     # normal R/RW SEC_IMAGE request could be force-upgraded to RX/RWX first
     # and permanently collapse an iOS 16KB host page to prot/max_prot == 0.
     force_anchor = r'''    if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
@@ -153,7 +153,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
     force_repl = r'''#ifdef WINE_IOS
     /* ===== WINARC_PE_SOURCE_PROTECT_V2 =====
      * The original SEC_IMAGE mapping is never an execution source on iOS;
-     * the JIT-pool copy is.  Suppress force_exec_prot BEFORE it can poison
+     * the JIT-pool copy is. Suppress force_exec_prot BEFORE it can poison
      * the source mapping's 16KB host page.
      */
     if (force_exec_prot && (unix_prot & PROT_READ) &&
@@ -215,21 +215,59 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
         raise SystemExit("virtual_ios.c normal EXEC mprotect block changed")
     wine = wine.replace(normal_anchor, normal_repl, 1)
 
-    existing_anchor = r'''                        ERR("iOS vm_protect RW failed kr=%d at %p+0x%lx (was rwx)\n",
+    existing_write_anchor = r'''                    if (unix_prot & PROT_WRITE)
+                    {
+                        kern_return_t kr = vm_protect(mach_task_self(),
+                            (vm_address_t)base, size, FALSE,
+                            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                        if (kr == KERN_SUCCESS) {
+                            ERR("iOS vm_protect RW+COPY OK at %p+0x%lx (was rwx)\n",
+                                base, (unsigned long)size);
+                            return 0;
+                        }
+                        ERR("iOS vm_protect RW failed kr=%d at %p+0x%lx (was rwx)\n",
                             kr, base, (unsigned long)size);
                     }
-                    mprotect( base, size, PROT_READ );
-                    return 0;
 '''
-    existing_repl = r'''                        ERR("iOS vm_protect RW failed kr=%d at %p+0x%lx (was rwx)\n",
-                            kr, base, (unsigned long)size);
+    existing_write_repl = r'''                    if (unix_prot & PROT_WRITE)
+                    {
+                        /* WinArc rev3: this image already executes from the JIT-pool copy.
+                         * Avoid Madeira's 4KB RW+COPY transition on the original PE source.
+                         * Restore the full iOS host page from Wine's logical vprot union;
+                         * mixed code/data becomes RW while EXEC remains pool-only. */
+                        static unsigned int winarc_existing_write_n;
+                        if (!ios_in_mach_exc && winarc_existing_write_n++ < 32)
+                            dprintf( 2,
+                                     "[WinArc PE Protect] existing-image WRITE %p+0x%lx "
+                                     "-> host-page union restore; no direct RW+COPY rev=3\n",
+                                     base, (unsigned long)size );
+                        winarc_restore_pe_source_protection( base, size, "existing-image-write" );
+                        return 0;
                     }
-                    winarc_restore_pe_source_protection( base, size, "existing-image" );
+'''
+    if wine.count(existing_write_anchor) != 1:
+        raise SystemExit("virtual_ios.c existing-image WRITE anchor changed or is ambiguous")
+    wine = wine.replace(existing_write_anchor, existing_write_repl, 1)
+
+    existing_read_anchor = r'''                    mprotect( base, size, PROT_READ );
                     return 0;
 '''
-    if existing_anchor not in wine:
-        raise SystemExit("virtual_ios.c existing-image source-protection anchor changed")
-    wine = wine.replace(existing_anchor, existing_repl, 1)
+    existing_read_repl = r'''                    winarc_restore_pe_source_protection( base, size, "existing-image-read" );
+                    return 0;
+'''
+    if wine.count(existing_read_anchor) < 1:
+        raise SystemExit("virtual_ios.c existing-image READ anchor changed")
+
+    write_pos = wine.index("existing-image WRITE")
+    read_pos = wine.find(existing_read_anchor, write_pos)
+    if read_pos < 0:
+        raise SystemExit("virtual_ios.c existing-image READ tail not found after WRITE branch")
+
+    wine = (
+        wine[:read_pos]
+        + existing_read_repl
+        + wine[read_pos + len(existing_read_anchor):]
+    )
 
     final_anchor = r'''            /* Leave original code section as read-only */
             mprotect( base, size, PROT_READ );
@@ -248,6 +286,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
     wine_path.write_text(wine, encoding="utf-8")
 
 wine_check = wine_path.read_text(encoding="utf-8")
+
 for needle in (
     WINE_MARKER,
     "winarc_is_sec_image_range",
@@ -255,6 +294,8 @@ for needle in (
     "skip direct EXEC mprotect for SEC_IMAGE",
     "suppress force_exec on SEC_IMAGE",
     'winarc_restore_pe_source_protection( base, size, "new-image" )',
+    "existing-image WRITE",
+    "no direct RW+COPY rev=3",
 ):
     if needle not in wine_check:
         raise SystemExit(f"Wine PE-protect post-check failed: {needle}")
@@ -284,14 +325,18 @@ alloc_c = alloc_c_path.read_text(encoding="utf-8")
 alloc_h = alloc_h_path.read_text(encoding="utf-8")
 
 jit_already = (
-    JIT_MARKER in helper and JIT_MARKER in alloc_c
-    and JIT_MARKER in alloc_h and JIT_MARKER in content
+    JIT_MARKER in helper
+    and JIT_MARKER in alloc_c
+    and JIT_MARKER in alloc_h
+    and JIT_MARKER in content
 )
 
 if not jit_already:
     include_anchor = "#include <errno.h>\n"
+
     if include_anchor not in alloc_c:
         raise SystemExit("JITAllocator.c include anchor changed")
+
     alloc_c = alloc_c.replace(
         include_anchor,
         include_anchor + "#include <sys/sysctl.h>\n#include <sys/proc.h>\n",
@@ -299,6 +344,7 @@ if not jit_already:
     )
 
     trap_anchor = "// SIGTRAP handler: skips BRK instruction (PC += 4) and zeros x0.\n"
+
     if trap_anchor not in alloc_c:
         raise SystemExit("JITAllocator.c SIGTRAP anchor changed")
 
@@ -313,25 +359,38 @@ bool jit_is_traced(void) {
     if (sysctl(mib, 4, &info, &size, NULL, 0) != 0) {
         return false;
     }
+
     return (info.kp_proc.p_flag & P_TRACED) != 0;
 }
 
 '''
-    alloc_c = alloc_c.replace(trap_anchor, trace_impl + trap_anchor, 1)
+
+    alloc_c = alloc_c.replace(
+        trap_anchor,
+        trace_impl + trap_anchor,
+        1,
+    )
 
     old_trap_check = '''    if (jit_check_debugged()) {
         jit_log("Debugger attached — skipping SIGTRAP handler (debugger handles BRK)");
         return;
     }
 '''
+
     new_trap_check = '''    if (jit_is_traced()) {
         jit_log("Debugger currently attached — skipping SIGTRAP handler (debugger handles BRK)");
         return;
     }
 '''
+
     if old_trap_check not in alloc_c:
         raise SystemExit("JITAllocator.c trap-install logic changed")
-    alloc_c = alloc_c.replace(old_trap_check, new_trap_check, 1)
+
+    alloc_c = alloc_c.replace(
+        old_trap_check,
+        new_trap_check,
+        1,
+    )
 
     native_pool_impl = r'''
 
@@ -345,44 +404,74 @@ static bool winarc_jit_prepare_low_frontier(void) {
     if (g_winarc_pin_frontier_ready) return true;
 
     const vm_address_t target = (vm_address_t)0x119000000ULL;
-    const vm_size_t chunk_size = (vm_size_t)(16ULL * 1024ULL * 1024ULL);
+    const vm_size_t chunk_size =
+        (vm_size_t)(16ULL * 1024ULL * 1024ULL);
 
     for (int i = g_winarc_pin_count; i < 32; ++i) {
         vm_address_t addr = 0;
-        kern_return_t kr = vm_allocate(mach_task_self(), &addr, chunk_size,
-                                       VM_FLAGS_ANYWHERE);
+
+        kern_return_t kr = vm_allocate(
+            mach_task_self(),
+            &addr,
+            chunk_size,
+            VM_FLAGS_ANYWHERE
+        );
+
         if (kr != KERN_SUCCESS) {
-            jit_log("[WinArc JIT] low-VA pin failed chunk=%d kr=%d", i, kr);
+            jit_log(
+                "[WinArc JIT] low-VA pin failed chunk=%d kr=%d",
+                i,
+                kr
+            );
             return false;
         }
 
         g_winarc_pin_chunks[g_winarc_pin_count++] = addr;
-        jit_log("[WinArc JIT] low-VA pin chunk=%d addr=0x%llx end=0x%llx",
-                i,
-                (unsigned long long)addr,
-                (unsigned long long)(addr + chunk_size));
+
+        jit_log(
+            "[WinArc JIT] low-VA pin chunk=%d addr=0x%llx end=0x%llx",
+            i,
+            (unsigned long long)addr,
+            (unsigned long long)(addr + chunk_size)
+        );
 
         if (addr + chunk_size >= target) {
             g_winarc_pin_frontier_ready = true;
-            jit_log("[WinArc JIT] low-VA frontier READY at 0x%llx target=0x%llx",
-                    (unsigned long long)(addr + chunk_size),
-                    (unsigned long long)target);
+
+            jit_log(
+                "[WinArc JIT] low-VA frontier READY at 0x%llx target=0x%llx",
+                (unsigned long long)(addr + chunk_size),
+                (unsigned long long)target
+            );
+
             return true;
         }
     }
 
-    jit_log("[WinArc JIT] low-VA frontier did not reach 0x%llx after %d chunks",
-            (unsigned long long)target, g_winarc_pin_count);
+    jit_log(
+        "[WinArc JIT] low-VA frontier did not reach 0x%llx after %d chunks",
+        (unsigned long long)target,
+        g_winarc_pin_count
+    );
+
     return false;
 }
 
-bool winarc_jit_native_pool_create(size_t size, void **rx_out, void **rw_out) {
-    if (!rx_out || !rw_out || size == 0) return false;
+bool winarc_jit_native_pool_create(
+    size_t size,
+    void **rx_out,
+    void **rw_out
+) {
+    if (!rx_out || !rw_out || size == 0)
+        return false;
 
     if (g_winarc_native_pool) {
-        if (jit_region_size(g_winarc_native_pool) < size) return false;
+        if (jit_region_size(g_winarc_native_pool) < size)
+            return false;
+
         *rx_out = jit_region_rx_ptr(g_winarc_native_pool);
         *rw_out = jit_region_rw_ptr(g_winarc_native_pool);
+
         return *rx_out != NULL && *rw_out != NULL;
     }
 
@@ -391,53 +480,98 @@ bool winarc_jit_native_pool_create(size_t size, void **rx_out, void **rw_out) {
     const uintptr_t guest_hi = 0x8000000000ULL;
 
     if (!winarc_jit_prepare_low_frontier()) {
-        jit_log("[WinArc JIT] native pool aborted: low-VA frontier prep failed");
+        jit_log(
+            "[WinArc JIT] native pool aborted: low-VA frontier prep failed"
+        );
+
         *rx_out = NULL;
         *rw_out = NULL;
+
         return false;
     }
 
     for (int attempt = 0; attempt < 2; ++attempt) {
         JITRegion *region = jit_region_create(size);
+
         if (!region) {
-            jit_log("[WinArc JIT] native pool create failed attempt=%d", attempt + 1);
+            jit_log(
+                "[WinArc JIT] native pool create failed attempt=%d",
+                attempt + 1
+            );
             continue;
         }
 
         uintptr_t rx = (uintptr_t)jit_region_rx_ptr(region);
         uintptr_t end = rx + size;
+
         bool overflow = end < rx;
         bool too_low = !overflow && rx < good_low;
-        bool overlaps_guest = !overflow && end > guest_lo && rx < guest_hi;
+        bool overlaps_guest =
+            !overflow &&
+            end > guest_lo &&
+            rx < guest_hi;
 
         if (!overflow && !too_low && !overlaps_guest) {
             g_winarc_native_pool = region;
+
             *rx_out = jit_region_rx_ptr(region);
             *rw_out = jit_region_rw_ptr(region);
-            jit_log("[WinArc JIT] native pool READY RX=%p RW=%p size=%zu",
-                    *rx_out, *rw_out, size);
+
+            jit_log(
+                "[WinArc JIT] native pool READY RX=%p RW=%p size=%zu",
+                *rx_out,
+                *rw_out,
+                size
+            );
+
             return true;
         }
 
-        const char *reason = overflow ? "overflow" :
-                             (too_low ? "mode-A-low" : "guest-64G-window");
-        jit_log("[WinArc JIT] reject native pool attempt=%d RX=%p size=%zu reason=%s",
-                attempt + 1, jit_region_rx_ptr(region), size, reason);
+        const char *reason =
+            overflow
+                ? "overflow"
+                : (too_low
+                    ? "mode-A-low"
+                    : "guest-64G-window");
+
+        jit_log(
+            "[WinArc JIT] reject native pool attempt=%d RX=%p size=%zu reason=%s",
+            attempt + 1,
+            jit_region_rx_ptr(region),
+            size,
+            reason
+        );
+
         jit_region_destroy(region);
 
-        if (overlaps_guest || overflow) break;
+        if (overlaps_guest || overflow)
+            break;
 
         if (too_low && g_winarc_pin_count < 32) {
             vm_address_t addr = 0;
-            const vm_size_t chunk_size = (vm_size_t)(16ULL * 1024ULL * 1024ULL);
-            kern_return_t kr = vm_allocate(mach_task_self(), &addr, chunk_size,
-                                           VM_FLAGS_ANYWHERE);
+
+            const vm_size_t chunk_size =
+                (vm_size_t)(16ULL * 1024ULL * 1024ULL);
+
+            kern_return_t kr = vm_allocate(
+                mach_task_self(),
+                &addr,
+                chunk_size,
+                VM_FLAGS_ANYWHERE
+            );
+
             if (kr == KERN_SUCCESS) {
                 g_winarc_pin_chunks[g_winarc_pin_count++] = addr;
-                jit_log("[WinArc JIT] extra low-VA pin addr=0x%llx",
-                        (unsigned long long)addr);
+
+                jit_log(
+                    "[WinArc JIT] extra low-VA pin addr=0x%llx",
+                    (unsigned long long)addr
+                );
             } else {
-                jit_log("[WinArc JIT] extra low-VA pin failed kr=%d", kr);
+                jit_log(
+                    "[WinArc JIT] extra low-VA pin failed kr=%d",
+                    kr
+                );
                 break;
             }
         }
@@ -445,6 +579,7 @@ bool winarc_jit_native_pool_create(size_t size, void **rx_out, void **rw_out) {
 
     *rx_out = NULL;
     *rw_out = NULL;
+
     return false;
 }
 
@@ -452,31 +587,48 @@ bool winarc_jit_native_pool_active(void) {
     return g_winarc_native_pool != NULL;
 }
 '''
+
     alloc_c = alloc_c.rstrip() + native_pool_impl + "\n"
 
     header_anchor = '''void jit_set_log_callback(jit_log_callback_t callback);
 
 #ifdef __cplusplus
 '''
+
     if header_anchor not in alloc_h:
         raise SystemExit("JITAllocator.h footer anchor changed")
+
     header_add = '''void jit_set_log_callback(jit_log_callback_t callback);
 
 // ===== WINARC_JIT_CORE_V1 =====
 bool jit_is_traced(void);
-bool winarc_jit_native_pool_create(size_t size, void **rx_out, void **rw_out);
+bool winarc_jit_native_pool_create(
+    size_t size,
+    void **rx_out,
+    void **rw_out
+);
 bool winarc_jit_native_pool_active(void);
 
 #ifdef __cplusplus
 '''
-    alloc_h = alloc_h.replace(header_anchor, header_add, 1)
+
+    alloc_h = alloc_h.replace(
+        header_anchor,
+        header_add,
+        1,
+    )
 
     if "import Darwin\n" not in helper:
-        helper = helper.replace("import UIKit\n", "import UIKit\nimport Darwin\n", 1)
+        helper = helper.replace(
+            "import UIKit\n",
+            "import UIKit\nimport Darwin\n",
+            1,
+        )
 
     jit_core_swift = r'''
 
 // ===== WINARC_JIT_CORE_V1 =====
+
 enum WinArcJITBackend: String {
     case nativeDirect = "native-direct"
     case legacyStikDebug = "stikdebug-legacy"
@@ -492,21 +644,30 @@ struct WinArcJITSnapshot {
     let extendedVA: Bool
     let stikAvailable: Bool
 
-    var hasExecutionGate: Bool { allowJIT || csDebugged }
-    var nativeCandidate: Bool { hasExecutionGate && dualMap }
+    var hasExecutionGate: Bool {
+        allowJIT || csDebugged
+    }
+
+    var nativeCandidate: Bool {
+        hasExecutionGate && dualMap
+    }
 }
 
 enum WinArcJITCore {
     private(set) static var backend: WinArcJITBackend = .unavailable
+
     private static var dualMapCache: Bool? = nil
     private static var legacyStikSession = false
 
-    static func probe(deep: Bool = true) -> WinArcJITSnapshot {
+    static func probe(
+        deep: Bool = true
+    ) -> WinArcJITSnapshot {
         let ent = EntitlementStatus.check()
         let cs = jit_check_debugged()
         let traced = jit_is_traced()
 
         let dual: Bool
+
         if let cached = dualMapCache {
             dual = cached
         } else if deep {
@@ -528,64 +689,106 @@ enum WinArcJITCore {
 
         LogStore.shared.log(
             "[WinArc JIT Probe] allow-jit=\(snapshot.allowJIT) " +
-            "CS_DEBUGGED=\(snapshot.csDebugged) traced=\(snapshot.traced) " +
-            "dual-map=\(snapshot.dualMap) memory+=\(snapshot.increasedMemory) " +
-            "64bitVA=\(snapshot.extendedVA) stik=\(snapshot.stikAvailable)"
+            "CS_DEBUGGED=\(snapshot.csDebugged) " +
+            "traced=\(snapshot.traced) " +
+            "dual-map=\(snapshot.dualMap) " +
+            "memory+=\(snapshot.increasedMemory) " +
+            "64bitVA=\(snapshot.extendedVA) " +
+            "stik=\(snapshot.stikAvailable)"
         )
+
         return snapshot
     }
 
-    private static func choose(_ snapshot: WinArcJITSnapshot) -> WinArcJITBackend {
-        if snapshot.nativeCandidate { return .nativeDirect }
-        if snapshot.stikAvailable { return .legacyStikDebug }
+    private static func choose(
+        _ snapshot: WinArcJITSnapshot
+    ) -> WinArcJITBackend {
+        if snapshot.nativeCandidate {
+            return .nativeDirect
+        }
+
+        if snapshot.stikAvailable {
+            return .legacyStikDebug
+        }
+
         return .unavailable
     }
 
-    static func enable(completion: @escaping (Bool) -> Void) {
+    static func enable(
+        completion: @escaping (Bool) -> Void
+    ) {
         let snapshot = probe(deep: true)
         let selected = choose(snapshot)
 
         switch selected {
         case .nativeDirect:
             backend = .nativeDirect
-            setenv("WINARC_JIT_BACKEND", backend.rawValue, 1)
+
+            setenv(
+                "WINARC_JIT_BACKEND",
+                backend.rawValue,
+                1
+            )
+
             LogStore.shared.log(
                 "[WinArc JIT Policy] selected=native-direct; no StikDebug launch",
                 level: .success
             )
+
             completion(true)
 
         case .legacyStikDebug:
             LogStore.shared.log(
                 "[WinArc JIT Policy] no existing execution gate; using StikDebug fallback"
             )
+
             StikJITHelper.enableJIT { success in
                 if success {
                     legacyStikSession = true
                     backend = .legacyStikDebug
-                    setenv("WINARC_JIT_BACKEND", backend.rawValue, 1)
+
+                    setenv(
+                        "WINARC_JIT_BACKEND",
+                        backend.rawValue,
+                        1
+                    )
+
                     LogStore.shared.log(
                         "[WinArc JIT Policy] StikDebug fallback attached",
                         level: .success
                     )
                 } else {
                     backend = .unavailable
-                    setenv("WINARC_JIT_BACKEND", backend.rawValue, 1)
+
+                    setenv(
+                        "WINARC_JIT_BACKEND",
+                        backend.rawValue,
+                        1
+                    )
+
                     LogStore.shared.log(
                         "[WinArc JIT Policy] StikDebug fallback failed",
                         level: .error
                     )
                 }
+
                 completion(success)
             }
 
         case .unavailable:
             backend = .unavailable
-            setenv("WINARC_JIT_BACKEND", backend.rawValue, 1)
+
+            setenv(
+                "WINARC_JIT_BACKEND",
+                backend.rawValue,
+                1
+            )
+
             LogStore.shared.log(
                 "[WinArc JIT Policy] no usable JIT capability/provider found",
                 level: .error
             )
+
             completion(false)
         }
     }
@@ -597,9 +800,16 @@ enum WinArcJITCore {
         }
 
         let snapshot = probe(deep: true)
+
         if choose(snapshot) == .nativeDirect {
             backend = .nativeDirect
-            setenv("WINARC_JIT_BACKEND", backend.rawValue, 1)
+
+            setenv(
+                "WINARC_JIT_BACKEND",
+                backend.rawValue,
+                1
+            )
+
             return true
         }
 
@@ -607,33 +817,58 @@ enum WinArcJITCore {
             "[WinArc JIT] runtime not ready; press Enable JIT to request fallback",
             level: .error
         )
+
         return false
     }
 
     static func allocatePool(
         poolSize: Int
-    ) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
+    ) -> (
+        rx: UnsafeMutableRawPointer,
+        rw: UnsafeMutableRawPointer,
+        size: Int
+    )? {
         if backend == .unavailable {
-            guard canStartRuntime() else { return nil }
+            guard canStartRuntime() else {
+                return nil
+            }
         }
 
         switch backend {
         case .nativeDirect:
             var rx: UnsafeMutableRawPointer? = nil
             var rw: UnsafeMutableRawPointer? = nil
-            let ok = winarc_jit_native_pool_create(poolSize, &rx, &rw)
+
+            let ok = winarc_jit_native_pool_create(
+                poolSize,
+                &rx,
+                &rw
+            )
+
             guard ok, let rx, let rw else {
-                LogStore.shared.log("[WinArc JIT] native pool allocation failed", level: .error)
+                LogStore.shared.log(
+                    "[WinArc JIT] native pool allocation failed",
+                    level: .error
+                )
+
                 return nil
             }
+
             LogStore.shared.log(
                 "[WinArc JIT] native pool selected; StikDebug BRK allocator bypassed",
                 level: .success
             )
-            return (rx: rx, rw: rw, size: poolSize)
+
+            return (
+                rx: rx,
+                rw: rw,
+                size: poolSize
+            )
 
         case .legacyStikDebug:
-            return StikJITHelper.allocatePool(poolSize: poolSize)
+            return StikJITHelper.allocatePool(
+                poolSize: poolSize
+            )
 
         case .unavailable:
             return nil
@@ -647,41 +882,55 @@ enum WinArcJITCore {
                 StikJITHelper.detachDebugger()
                 legacyStikSession = false
             }
+
         case .nativeDirect, .unavailable:
             break
         }
     }
 }
 '''
+
     helper = helper.rstrip() + jit_core_swift + "\n"
 
     button_old = '''                Button("Enable JIT") {
                     enableJITViaStikDebug()
                 }
 '''
+
     button_new = '''                Button("Enable JIT") {
                     enableJITSmart()
                 }
 '''
+
     if button_old not in content:
         raise SystemExit("ContentView Enable JIT button changed")
-    content = content.replace(button_old, button_new, 1)
+
+    content = content.replace(
+        button_old,
+        button_new,
+        1,
+    )
 
     smart_func = r'''    // ===== WINARC_JIT_CORE_V1 =====
     private func enableJITSmart() {
         jitStatus = .testing
-        logStore.log("WinArc JIT: probing capabilities...")
+
+        logStore.log(
+            "WinArc JIT: probing capabilities..."
+        )
 
         WinArcJITCore.enable { success in
             DispatchQueue.main.async {
                 if success {
                     jitStatus = .available
+
                     logStore.log(
                         "WinArc JIT ready: \(WinArcJITCore.backend.rawValue)",
                         level: .success
                     )
                 } else {
                     jitStatus = .unavailable
+
                     logStore.log(
                         "No usable JIT route. Existing capability and StikDebug fallback both unavailable.",
                         level: .error
@@ -692,30 +941,66 @@ enum WinArcJITCore {
     }
 
 '''
-    func_anchor = "    private func enableJITViaStikDebug() {\n"
+
+    func_anchor =
+        "    private func enableJITViaStikDebug() {\n"
+
     if func_anchor not in content:
-        raise SystemExit("ContentView enableJITViaStikDebug anchor changed")
-    content = content.replace(func_anchor, smart_func + func_anchor, 1)
+        raise SystemExit(
+            "ContentView enableJITViaStikDebug anchor changed"
+        )
+
+    content = content.replace(
+        func_anchor,
+        smart_func + func_anchor,
+        1,
+    )
 
     guard_old = '''        guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
             return
         }
 '''
+
     guard_new = '''        guard WinArcJITCore.canStartRuntime() else {
             logStore.log("WinArc JIT is not ready. Press 'Enable JIT' first.", level: .error)
             return
         }
 '''
-    if guard_old not in content:
-        raise SystemExit("ContentView runWineFullSequence JIT guard changed")
-    content = content.replace(guard_old, guard_new, 1)
 
-    pool_old = "let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)"
-    pool_new = "let pool = WinArcJITCore.allocatePool(poolSize: poolSizeMB * 1024 * 1024)"
+    if guard_old not in content:
+        raise SystemExit(
+            "ContentView runWineFullSequence JIT guard changed"
+        )
+
+    content = content.replace(
+        guard_old,
+        guard_new,
+        1,
+    )
+
+    pool_old = (
+        "let pool = "
+        "StikJITHelper.allocatePool("
+        "poolSize: poolSizeMB * 1024 * 1024)"
+    )
+
+    pool_new = (
+        "let pool = "
+        "WinArcJITCore.allocatePool("
+        "poolSize: poolSizeMB * 1024 * 1024)"
+    )
+
     if pool_old not in content:
-        raise SystemExit("ContentView pool allocation call changed")
-    content = content.replace(pool_old, pool_new, 1)
+        raise SystemExit(
+            "ContentView pool allocation call changed"
+        )
+
+    content = content.replace(
+        pool_old,
+        pool_new,
+        1,
+    )
 
     pool_fail_old = '''                logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
                 logStore.log("  All placements landed in the forbidden guest 64G window.", level: .info)
@@ -723,39 +1008,88 @@ enum WinArcJITCore {
                 logStore.log("  and depends on current memory layout, so a fresh process", level: .info)
                 logStore.log("  usually lands somewhere valid.", level: .info)
 '''
+
     pool_fail_new = '''                logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
                 logStore.log("  See [WinArc JIT] lines above for the exact placement reason.", level: .info)
                 logStore.log("  native-direct rejects mode-A-low and guest-window placements.", level: .info)
                 logStore.log("  Do not infer the cause from the final nil alone.", level: .info)
 '''
+
     if pool_fail_old not in content:
-        raise SystemExit("ContentView pool failure text changed")
-    content = content.replace(pool_fail_old, pool_fail_new, 1)
+        raise SystemExit(
+            "ContentView pool failure text changed"
+        )
+
+    content = content.replace(
+        pool_fail_old,
+        pool_fail_new,
+        1,
+    )
 
     if "StikJITHelper.detachDebugger()" not in content:
-        raise SystemExit("ContentView detach call not found")
+        raise SystemExit(
+            "ContentView detach call not found"
+        )
+
     content = content.replace(
         "StikJITHelper.detachDebugger()",
-        "WinArcJITCore.detachIfNeeded()"
+        "WinArcJITCore.detachIfNeeded()",
     )
+
     content += "\n// WINARC_JIT_CORE_V1\n"
 
-    alloc_c_path.write_text(alloc_c, encoding="utf-8")
-    alloc_h_path.write_text(alloc_h, encoding="utf-8")
-    helper_path.write_text(helper, encoding="utf-8")
-    content_path.write_text(content, encoding="utf-8")
+    alloc_c_path.write_text(
+        alloc_c,
+        encoding="utf-8",
+    )
+
+    alloc_h_path.write_text(
+        alloc_h,
+        encoding="utf-8",
+    )
+
+    helper_path.write_text(
+        helper,
+        encoding="utf-8",
+    )
+
+    content_path.write_text(
+        content,
+        encoding="utf-8",
+    )
 
 checks = {
-    alloc_c_path: [JIT_MARKER, "bool jit_is_traced(void)", "winarc_jit_native_pool_create"],
-    alloc_h_path: [JIT_MARKER, "winarc_jit_native_pool_create"],
-    helper_path: [JIT_MARKER, "enum WinArcJITCore", "native-direct", "stikdebug-legacy"],
-    content_path: [JIT_MARKER, "enableJITSmart()", "WinArcJITCore.allocatePool", "WinArcJITCore.detachIfNeeded"],
+    alloc_c_path: [
+        JIT_MARKER,
+        "bool jit_is_traced(void)",
+        "winarc_jit_native_pool_create",
+    ],
+    alloc_h_path: [
+        JIT_MARKER,
+        "winarc_jit_native_pool_create",
+    ],
+    helper_path: [
+        JIT_MARKER,
+        "enum WinArcJITCore",
+        "native-direct",
+        "stikdebug-legacy",
+    ],
+    content_path: [
+        JIT_MARKER,
+        "enableJITSmart()",
+        "WinArcJITCore.allocatePool",
+        "WinArcJITCore.detachIfNeeded",
+    ],
 }
+
 for path, needles in checks.items():
     text = path.read_text(encoding="utf-8")
+
     for needle in needles:
         if needle not in text:
-            raise SystemExit(f"post-patch check failed: {path}: {needle}")
+            raise SystemExit(
+                f"post-patch check failed: {path}: {needle}"
+            )
 
 print("WINARC_JIT_CORE_V1=PASS")
 print("WINARC_VERSION=0.0.1")
