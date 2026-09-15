@@ -942,8 +942,7 @@ enum WinArcJITCore {
 
 '''
 
-    func_anchor =
-        "    private func enableJITViaStikDebug() {\n"
+func_anchor = "    private func enableJITViaStikDebug() {\n"
 
     if func_anchor not in content:
         raise SystemExit(
