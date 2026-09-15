@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 JIT_MARKER = "WINARC_JIT_CORE_V1"
-WINE_MARKER = "WINARC_PE_SOURCE_PROTECT_V1"
+WINE_MARKER = "WINARC_PE_SOURCE_PROTECT_V2"
 
 args = sys.argv[1:]
 if len(args) not in (1, 2):
@@ -32,7 +32,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
     helper = r'''volatile int ios_in_mach_exc;
 
-/* ===== WINARC_PE_SOURCE_PROTECT_V1 =====
+/* ===== WINARC_PE_SOURCE_PROTECT_V2 =====
  *
  * Wine tracks PE protection at 4KB granularity, while iOS has 16KB host pages.
  * One host page can therefore contain both executable bytes and WRITECOPY/data.
@@ -119,7 +119,7 @@ static void winarc_restore_pe_source_protection( void *base, size_t size,
             ++log_n;
             dprintf( 2,
                      "[WinArc PE Protect] %s host=%p vprot=0x%x want=%c%c "
-                     "mprotect=%d vmkr=%d actual=%s0x%x max=%s0x%x rev=v1\n",
+                     "mprotect=%d vmkr=%d actual=%s0x%x max=%s0x%x rev=v2\n",
                      site ? site : "?",
                      (void *)p, (unsigned)vprot,
                      (want & PROT_READ) ? 'r' : '-',
@@ -134,6 +134,57 @@ static void winarc_restore_pe_source_protection( void *base, size_t size,
 static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 '''
     wine = wine.replace(helper_anchor, helper, 1)
+
+    # V2 root fix: Madeira's force_exec_prot runs BEFORE the iOS JIT-pool
+    # branch.  V1 intercepted only the later explicit PROT_EXEC path, so a
+    # normal R/RW SEC_IMAGE request could be force-upgraded to RX/RWX first
+    # and permanently collapse an iOS 16KB host page to prot/max_prot == 0.
+    force_anchor = r'''    if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
+    {
+        if (!ios_in_mach_exc)                   /* ml374: see ios_in_mach_exc */
+            TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
+        if (!mprotect( base, size, unix_prot | PROT_EXEC )) return 0;
+        /* exec + write may legitimately fail, in that case fall back to write only */
+        if (!(unix_prot & PROT_WRITE)) return -1;
+    }
+
+#ifdef WINE_IOS
+'''
+    force_repl = r'''#ifdef WINE_IOS
+    /* ===== WINARC_PE_SOURCE_PROTECT_V2 =====
+     * The original SEC_IMAGE mapping is never an execution source on iOS;
+     * the JIT-pool copy is.  Suppress force_exec_prot BEFORE it can poison
+     * the source mapping's 16KB host page.
+     */
+    if (force_exec_prot && (unix_prot & PROT_READ) &&
+        !(unix_prot & PROT_EXEC) &&
+        winarc_is_sec_image_range( base, size ))
+    {
+        static unsigned int force_skip_n;
+        if (!ios_in_mach_exc && force_skip_n++ < 32)
+            dprintf( 2,
+                     "[WinArc PE Protect] suppress force_exec on SEC_IMAGE "
+                     "%p+0x%lx requested=%c%c-; source remains non-exec rev=v2\n",
+                     base, (unsigned long)size,
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-' );
+    }
+    else
+#endif
+    if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
+    {
+        if (!ios_in_mach_exc)                   /* ml374: see ios_in_mach_exc */
+            TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
+        if (!mprotect( base, size, unix_prot | PROT_EXEC )) return 0;
+        /* exec + write may legitimately fail, in that case fall back to write only */
+        if (!(unix_prot & PROT_WRITE)) return -1;
+    }
+
+#ifdef WINE_IOS
+'''
+    if force_anchor not in wine:
+        raise SystemExit("virtual_ios.c force_exec_prot anchor changed")
+    wine = wine.replace(force_anchor, force_repl, 1)
 
     normal_anchor = r'''        /* Try normal mprotect first (works on non-TXM devices). On iOS TXM,
          * mprotect with PROT_EXEC may *appear* to succeed (return 0) without
@@ -202,16 +253,17 @@ for needle in (
     "winarc_is_sec_image_range",
     "winarc_restore_pe_source_protection",
     "skip direct EXEC mprotect for SEC_IMAGE",
+    "suppress force_exec on SEC_IMAGE",
     'winarc_restore_pe_source_protection( base, size, "new-image" )',
 ):
     if needle not in wine_check:
         raise SystemExit(f"Wine PE-protect post-check failed: {needle}")
 
-print("WINARC_WINE_PE_SOURCE_PROTECT_V1=PASS")
+print("WINARC_WINE_PE_SOURCE_PROTECT_V2=PASS")
 
 if wine_only:
     print("WINARC_VERSION=0.0.1")
-    print("WINARC_WINE_PATCHES=PE_SOURCE_PROTECT_V1")
+    print("WINARC_WINE_PATCHES=PE_SOURCE_PROTECT_V2")
     print("WINARC_FEX_PATCHES=NONE")
     print("WINARC_DXMT_PATCHES=NONE")
     raise SystemExit(0)
@@ -710,6 +762,6 @@ print("WINARC_VERSION=0.0.1")
 print("WINARC_JIT_POLICY=CAPABILITY_DRIVEN")
 print("WINARC_JIT_NATIVE_POOL=MADEIRA_DUALMAP")
 print("WINARC_JIT_STIKDEBUG=FALLBACK_ONLY")
-print("WINARC_WINE_PATCHES=PE_SOURCE_PROTECT_V1")
+print("WINARC_WINE_PATCHES=PE_SOURCE_PROTECT_V2")
 print("WINARC_FEX_PATCHES=NONE")
 print("WINARC_DXMT_PATCHES=NONE")
