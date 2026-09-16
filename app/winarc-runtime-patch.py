@@ -9,12 +9,41 @@ WINE_MARKER = "WINARC_PE_SOURCE_PROTECT_V2"
 
 args = sys.argv[1:]
 if len(args) not in (1, 2):
-    raise SystemExit("usage: winarc-runtime-patch.py <madeira-checkout> [--wine-only]")
+    raise SystemExit("usage: winarc-runtime-patch.py <madeira-checkout> [--wine-only|--fex-only]")
 
 root = Path(args[0]).resolve()
 wine_only = len(args) == 2 and args[1] == "--wine-only"
-if len(args) == 2 and not wine_only:
+fex_only = len(args) == 2 and args[1] == "--fex-only"
+if len(args) == 2 and not (wine_only or fex_only):
     raise SystemExit(f"unknown mode: {args[1]}")
+
+if fex_only:
+    # This is the PE translator, not the native FEXBridge test context.
+    # Rebuild arm64ecfex and replace xtajit64.dll after applying this mode.
+    path = root / "FEX/Source/Windows/Common/CPUFeatures.cpp"
+    source = path.read_text(encoding="utf-8")
+    start = source.index("#ifdef FEX_IOS_HOST\n", source.index("CPUFeatures::FetchHostFeatures"))
+    end = source.index("#else", start)
+    block = source[start:end]
+    marker = "WINARC_FEX_BASELINE_V1"
+    if marker not in block:
+        for feature in ("FlagM", "FlagM2", "AFP"):
+            old = f"  HostFeatures.Supports{feature} = true;"
+            if block.count(old) != 1:
+                raise SystemExit(f"FEX host feature anchor changed: {feature}")
+            block = block.replace(old, f"  HostFeatures.Supports{feature} = false;")
+        anchor = "  HostFeatures.HostType = HostType;"
+        if block.count(anchor) != 1:
+            raise SystemExit("FEX HostType anchor changed")
+        block = block.replace(anchor, anchor + '\n  // WINARC_FEX_BASELINE_V1: optional extensions require positive detection.\n'
+                              '  LogMan::Msg::IFmt("WINARC_FEX_BASELINE_V1 FlagM=0 FlagM2=0 AFP=0");')
+        source = source[:start] + block + source[end:]
+        path.write_text(source, encoding="utf-8")
+    for feature in ("FlagM", "FlagM2", "AFP"):
+        if f"HostFeatures.Supports{feature} = false;" not in block:
+            raise SystemExit(f"FEX baseline verification failed: {feature}")
+    print("WINARC_FEX_BASELINE_V1=PASS")
+    raise SystemExit(0)
 
 wine_path = root / "build" / "ntdll-unix" / "virtual_ios.c"
 if not wine_path.is_file():
@@ -188,7 +217,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
     normal_anchor = r'''        /* Try normal mprotect first (works on non-TXM devices). On iOS TXM,
          * mprotect with PROT_EXEC may *appear* to succeed (return 0) without
-         * actually granting EXEC — pages stay RW only. Verify by querying the
+         * actually granting EXEC â pages stay RW only. Verify by querying the
          * actual page protection via Mach vm_region_64; only return early if
          * EXEC was truly granted. */
         if (!mprotect( base, size, unix_prot ))
@@ -372,13 +401,13 @@ bool jit_is_traced(void) {
     )
 
     old_trap_check = '''    if (jit_check_debugged()) {
-        jit_log("Debugger attached — skipping SIGTRAP handler (debugger handles BRK)");
+        jit_log("Debugger attached â skipping SIGTRAP handler (debugger handles BRK)");
         return;
     }
 '''
 
     new_trap_check = '''    if (jit_is_traced()) {
-        jit_log("Debugger currently attached — skipping SIGTRAP handler (debugger handles BRK)");
+        jit_log("Debugger currently attached â skipping SIGTRAP handler (debugger handles BRK)");
         return;
     }
 '''
@@ -1001,14 +1030,14 @@ enum WinArcJITCore {
         1,
     )
 
-    pool_fail_old = '''                logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
+    pool_fail_old = '''                logStore.log("JIT pool allocation FAILED â not starting Wine.", level: .error)
                 logStore.log("  All placements landed in the forbidden guest 64G window.", level: .info)
                 logStore.log("  Force-quit and relaunch: placement is chosen by the kernel", level: .info)
                 logStore.log("  and depends on current memory layout, so a fresh process", level: .info)
                 logStore.log("  usually lands somewhere valid.", level: .info)
 '''
 
-    pool_fail_new = '''                logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
+    pool_fail_new = '''                logStore.log("JIT pool allocation FAILED â not starting Wine.", level: .error)
                 logStore.log("  See [WinArc JIT] lines above for the exact placement reason.", level: .info)
                 logStore.log("  native-direct rejects mode-A-low and guest-window placements.", level: .info)
                 logStore.log("  Do not infer the cause from the final nil alone.", level: .info)
