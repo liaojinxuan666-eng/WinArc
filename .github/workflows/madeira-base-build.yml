@@ -7,6 +7,7 @@ on:
     paths:
       - ".github/workflows/madeira-base-build.yml"
       - "app/winarc-runtime-patch.py"
+      - "tests/test-winarc-memory-policy.py"
 
 permissions:
   contents: read
@@ -52,6 +53,12 @@ jobs:
           git -C "$M" checkout "$MADEIRA_COMMIT"
           test "$(git -C "$M" rev-parse HEAD)" = "$MADEIRA_COMMIT"
 
+      - name: Verify memory policy and complete runtime patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/test-winarc-memory-policy.py "$RUNNER_TEMP/Madeira"
+
       - name: Apply WinArc PE Protect V2
         shell: bash
         run: |
@@ -62,6 +69,7 @@ jobs:
             | tee winarc-wine-patch.log
 
           grep -Fx "WINARC_WINE_PE_SOURCE_PROTECT_V2=PASS" winarc-wine-patch.log
+          grep -Fx "WINARC_MEMORY_MODE=AUDIT_V1" winarc-wine-patch.log
           grep -Fx "WINARC_VERSION=0.0.1" winarc-wine-patch.log
           grep -Fx "WINARC_WINE_PATCHES=PE_SOURCE_PROTECT_V2" winarc-wine-patch.log
           grep -F "suppress force_exec on SEC_IMAGE" \
