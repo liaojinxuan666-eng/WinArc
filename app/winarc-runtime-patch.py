@@ -488,13 +488,13 @@ bool jit_is_traced(void) {
     )
 
     old_trap_check = '''    if (jit_check_debugged()) {
-        jit_log("Debugger attached â skipping SIGTRAP handler (debugger handles BRK)");
+        jit_log("Debugger attached \u2014 skipping SIGTRAP handler (debugger handles BRK)");
         return;
     }
 '''
 
     new_trap_check = '''    if (jit_is_traced()) {
-        jit_log("Debugger currently attached â skipping SIGTRAP handler (debugger handles BRK)");
+        jit_log("Debugger currently attached \u2014 skipping SIGTRAP handler (debugger handles BRK)");
         return;
     }
 '''
@@ -1117,14 +1117,14 @@ enum WinArcJITCore {
         1,
     )
 
-    pool_fail_old = '''                logStore.log("JIT pool allocation FAILED â not starting Wine.", level: .error)
+    pool_fail_old = '''                logStore.log("JIT pool allocation FAILED \u2014 not starting Wine.", level: .error)
                 logStore.log("  All placements landed in the forbidden guest 64G window.", level: .info)
                 logStore.log("  Force-quit and relaunch: placement is chosen by the kernel", level: .info)
                 logStore.log("  and depends on current memory layout, so a fresh process", level: .info)
                 logStore.log("  usually lands somewhere valid.", level: .info)
 '''
 
-    pool_fail_new = '''                logStore.log("JIT pool allocation FAILED â not starting Wine.", level: .error)
+    pool_fail_new = '''                logStore.log("JIT pool allocation FAILED \u2014 not starting Wine.", level: .error)
                 logStore.log("  See [WinArc JIT] lines above for the exact placement reason.", level: .info)
                 logStore.log("  native-direct rejects mode-A-low and guest-window placements.", level: .info)
                 logStore.log("  Do not infer the cause from the final nil alone.", level: .info)
