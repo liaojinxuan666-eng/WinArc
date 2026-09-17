@@ -215,13 +215,11 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
         raise SystemExit("virtual_ios.c force_exec_prot anchor changed")
     wine = wine.replace(force_anchor, force_repl, 1)
 
-    normal_anchor = r'''        /* Try normal mprotect first (works on non-TXM devices). On iOS TXM,
-         * mprotect with PROT_EXEC may *appear* to succeed (return 0) without
-         * actually granting EXEC â pages stay RW only. Verify by querying the
-         * actual page protection via Mach vm_region_64; only return early if
-         * EXEC was truly granted. */
-        if (!mprotect( base, size, unix_prot ))
+    # Scope the executable path by code, not by a prose comment whose UTF-8
+    # punctuation was corrupted during transfer. Require a unique body match.
+    normal_anchor = r'''        if (!mprotect( base, size, unix_prot ))
         {
+            mach_vm_address_t addr = (mach_vm_address_t)base;
 '''
     normal_repl = r'''        /* WinArc: SEC_IMAGE executable ranges always use the JIT-pool copy.
          * Do not let direct RX/RWX mprotect touch the original PE mapping:
@@ -239,10 +237,17 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
         }
         else if (!mprotect( base, size, unix_prot ))
         {
+            mach_vm_address_t addr = (mach_vm_address_t)base;
 '''
-    if normal_anchor not in wine:
-        raise SystemExit("virtual_ios.c normal EXEC mprotect block changed")
-    wine = wine.replace(normal_anchor, normal_repl, 1)
+    function_start = wine.index("static inline int mprotect_exec(")
+    ios_start = wine.index("#ifdef WINE_IOS", function_start)
+    exec_start = wine.index("    if (unix_prot & PROT_EXEC)\n    {", ios_start)
+    scope_end = wine.index("static BOOL set_vprot(", exec_start)
+    matches = wine[exec_start:scope_end].count(normal_anchor)
+    if matches != 1:
+        raise SystemExit(f"virtual_ios.c normal EXEC mprotect block changed or ambiguous ({matches})")
+    normal_pos = wine.index(normal_anchor, exec_start, scope_end)
+    wine = wine[:normal_pos] + normal_repl + wine[normal_pos + len(normal_anchor):]
 
     existing_write_anchor = r'''                    if (unix_prot & PROT_WRITE)
                     {
@@ -314,6 +319,85 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
     wine_path.write_text(wine, encoding="utf-8")
 
+# Stage 1 of hybrid memory: audit existing PE source restores. Wine's vprot
+# table remains authoritative; this does not enable a software MMU or change
+# rev3 protection requests. Checked access and native ABI integration follow.
+memory_helper = r'''/* WINARC_MEMORY_AUDIT_V1_BEGIN */
+enum winarc_memory_reason
+{
+    WINARC_MEM_MIXED = 1,
+    WINARC_MEM_UNCOMMITTED = 2,
+    WINARC_MEM_GUARD = 4,
+    WINARC_MEM_COPY = 8,
+    WINARC_MEM_WRITEWATCH = 16,
+    WINARC_MEM_CODE = 32,
+    WINARC_MEM_GEOMETRY = 64
+};
+
+struct winarc_memory_policy
+{
+    unsigned int reasons;
+    unsigned int pages;
+    int first_data_prot;
+};
+
+/* A data-only direct candidate must have identical effective R/W permissions
+ * on every guest page and no outstanding guest-side semantics. Execute pages
+ * require separate guest-ISA/native-ISA classification; do not infer it here.
+ */
+static void winarc_memory_add_page( struct winarc_memory_policy *state, BYTE vprot )
+{
+    int data_prot = get_unix_prot( vprot ) & ~PROT_EXEC;
+    if (state->pages && data_prot != state->first_data_prot)
+        state->reasons |= WINARC_MEM_MIXED;
+    if (!state->pages) state->first_data_prot = data_prot;
+    ++state->pages;
+    if (!(vprot & VPROT_COMMITTED)) state->reasons |= WINARC_MEM_UNCOMMITTED;
+    if (vprot & VPROT_GUARD) state->reasons |= WINARC_MEM_GUARD;
+    if (vprot & VPROT_WRITECOPY) state->reasons |= WINARC_MEM_COPY;
+    if (vprot & VPROT_WRITEWATCH) state->reasons |= WINARC_MEM_WRITEWATCH;
+    if (vprot & VPROT_EXEC) state->reasons |= WINARC_MEM_CODE;
+}
+
+static struct winarc_memory_policy winarc_memory_describe_host_page( uintptr_t host )
+{
+    struct winarc_memory_policy state = {0};
+    size_t offset;
+    if (!page_size || !host_page_size || host_page_size % page_size ||
+        host % host_page_size || host > ~(uintptr_t)0 - host_page_size)
+    {
+        state.reasons = WINARC_MEM_GEOMETRY;
+        return state;
+    }
+    for (offset = 0; offset < host_page_size; offset += page_size)
+        winarc_memory_add_page( &state, get_page_vprot( (void *)(host + offset) ) );
+    return state;
+}
+/* WINARC_MEMORY_AUDIT_V1_END */
+
+'''
+
+memory_marker = "WINARC_MEMORY_AUDIT_V1_BEGIN"
+if memory_marker not in wine:
+    restore_anchor = "/* Restore physical source pages from the union of Wine's logical 4KB vprot."
+    log_anchor = """            ++log_n;
+            dprintf( 2,
+                     "[WinArc PE Protect] %s host=%p vprot=0x%x want=%c%c """
+    if wine.count(restore_anchor) != 1 or wine.count(log_anchor) != 1:
+        raise SystemExit("WinArc memory audit integration anchors changed")
+    wine = wine.replace(restore_anchor, memory_helper + restore_anchor, 1)
+    log_repl = """            struct winarc_memory_policy policy = winarc_memory_describe_host_page( p );
+            ++log_n;
+            dprintf( 2, "[WinArc Memory] mode=audit scope=pe-source host=%p guest_pages=%u "
+                         "route=%s reasons=0x%x access_checks=disabled\\n",
+                     (void *)p, policy.pages,
+                     policy.reasons ? "checked-required" : "direct-data-candidate",
+                     policy.reasons );
+            dprintf( 2,
+                     "[WinArc PE Protect] %s host=%p vprot=0x%x want=%c%c """
+    wine = wine.replace(log_anchor, log_repl, 1)
+    wine_path.write_text(wine, encoding="utf-8")
+
 wine_check = wine_path.read_text(encoding="utf-8")
 
 for needle in (
@@ -325,11 +409,14 @@ for needle in (
     'winarc_restore_pe_source_protection( base, size, "new-image" )',
     "existing-image WRITE",
     "no direct RW+COPY rev=3",
+    memory_marker,
+    "access_checks=disabled",
 ):
     if needle not in wine_check:
         raise SystemExit(f"Wine PE-protect post-check failed: {needle}")
 
 print("WINARC_WINE_PE_SOURCE_PROTECT_V2=PASS")
+print("WINARC_MEMORY_MODE=AUDIT_V1")
 
 if wine_only:
     print("WINARC_VERSION=0.0.1")
